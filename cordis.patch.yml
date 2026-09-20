@@ -1,0 +1,64 @@
+# The @argszero/cordis-plugin-length-stop-overflow bundle patch.
+# Mounting needs no configuration: mode='error' by default.
+#
+#   - set:
+#       - id: length-stop-overflow
+#         config:
+#           mode: error                  # error | warn | off
+#           atMostOutputTokens: 2        # raise it if your backend clamps to a
+#                                        # small positive remainder instead of 1
+#
+# What it guards (discussion #7214). A provider can answer "your request was too
+# large" without failing: it truncates and says `finish_reason: "length"`, which
+# `dsh-llm` maps to `{ kind: 'max-tokens' }` — an ordinary output cap, and a
+# sticky terminal turn end with no recovery hook.
+#
+# The reported session ended turns with ONE output token, forever. The one token
+# is not the provider's choice:
+#
+#   llm-pi-ai/src/adapter.ts:380  -> pi-ai streamSimple
+#   @earendil-works/pi-ai/dist/api/simple-options.js:2-9
+#     const available = model.contextWindow - estimateContextTokens(context).tokens - 4096
+#     return Math.min(maxTokens, Math.max(1 /* MIN_MAX_TOKENS */, available))
+#
+# Past the window dsh *believes* in, the budget is clamped to its floor of 1 and
+# dsh really sends `max_tokens: 1`. The provider answers `length` after one
+# token, correctly. pi-ai's own overflow sniff then requires exactly ZERO output
+# (dist/utils/overflow.js:149) — the floor of one is what keeps the count off it
+# — and llm-pi-ai falls through to `case 'length': { kind: 'max-tokens' }`
+# (stream.ts:109).
+#
+# Two guards then miss, for opposite reasons: REPETITION-based loop detectors see
+# a different one-token answer each time (it is a valid prefix estimate, neither
+# aborted nor error, so the next request re-sends the same over-long prompt), and
+# the pressure threshold that would trigger compaction is computed from a window
+# the provider does not share (see discussion #7213).
+#
+# The overflow recovery built for this situation is gated on a code nothing on
+# this path produces:
+#
+#   compaction-basic/src/index.ts:180
+#     if (failure.code !== CONTEXT_WINDOW_EXCEEDED_CODE || signal.aborted) return next()
+#
+# mode='error' rewrites the truncating finish into that code, so the loop routes
+# it to agent/request-error (agent-loop/src/agent.ts:445-464) and
+# @deepseek-ai/dsh-compaction-basic — mounted in bundle/base and bundle/web-app —
+# compacts and returns { kind: 'retry' }, bounded by its maxOverflowRetries
+# (default 1; compaction-basic/src/config.ts:93), so there is no retry loop.
+#
+# On an `error` finish the loop settles only `assistant/attempt`
+# (agent-loop/src/agent.ts:445-448) and never appends `assistant/message`, so the
+# degenerate one-token answer does not enter the derived conversation — the
+# compaction summarizes a history without it.
+#
+# The verdict is window-independent: a `max-tokens` finish with a negligible
+# output count is a truncation of *our* request by construction, because the real
+# output cap is the model's own (tens of thousands of tokens in the catalog). A
+# finish that carries no `usage` chunk is left alone (fail-closed).
+#
+# Start with mode='warn' to measure how often your own traffic hits the threshold
+# before letting it change behaviour.
+
+- insert:
+    - id: length-stop-overflow
+      name: '@argszero/cordis-plugin-length-stop-overflow'
