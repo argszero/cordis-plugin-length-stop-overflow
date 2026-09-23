@@ -1,7 +1,7 @@
 {
   "name": "@argszero/cordis-plugin-length-stop-overflow",
-  "description": "Length-stop overflow guard for dsh: observes the llm/stream waterfall and reclassifies a max-tokens finish whose output count is negligible. A provider (or pi-ai's own context clamp) that truncates an over-long request answers finish_reason 'length'; the harness reads that as an ordinary output cap, so agent/request-error never sees CONTEXT_WINDOW_EXCEEDED and the context-overflow recovery never runs - the session answers 'continue' with one token forever. Compatible with every prerelease line from 0.1.3-alpha.2 onward (0.1.3/0.1.5/0.1.6).",
-  "version": "0.1.0",
+  "description": "Overflow guard for dsh: observes the llm/stream waterfall and restores the CONTEXT_WINDOW_EXCEEDED classification the built-in recovery keys on, for two ways a provider can refuse an over-long request without naming it. (1) A max-tokens finish whose output count is negligible: a provider (or pi-ai's own context clamp) that truncates an over-long request answers finish_reason 'length', which the harness reads as an ordinary output cap, so the session answers 'continue' with one token forever. (2) A request refused for its size (HTTP 413, or size wording on a request-rejection code) while every in-tree budget reports headroom, because the harness prices a request in tokens and never in bytes. Compatible with every prerelease line from 0.1.3-alpha.2 onward (0.1.3/0.1.5/0.1.6).",
+  "version": "0.2.0",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -33,6 +33,9 @@
     "length",
     "finish_reason",
     "truncation",
+    "413",
+    "payload-too-large",
+    "request-too-large",
     "pi-ai"
   ],
   "dsh": {
@@ -49,13 +52,14 @@
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-llm": "0.1.6-alpha.2",
-    "typescript": "^5.5.0",
+    "@deepseek-ai/dsh-compaction-basic": "0.1.6-alpha.2",
     "@deepseek-ai/dsh-invariants": "0.1.6-alpha.2",
+    "@deepseek-ai/dsh-llm": "0.1.6-alpha.2",
     "@deepseek-ai/dsh-session": "0.1.6-alpha.2",
     "@deepseek-ai/dsh-session-projection": "0.1.6-alpha.2",
     "@deepseek-ai/dsh-token-meter": "0.1.6-alpha.2",
-    "@deepseek-ai/dsh-compaction-basic": "0.1.6-alpha.2"
+    "@types/node": "^24.13.6",
+    "typescript": "^5.5.0"
   },
   "scripts": {
     "build": "tsc",

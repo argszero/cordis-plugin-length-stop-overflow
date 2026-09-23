@@ -37,6 +37,15 @@ const REPORTED_TURN = [
   { type: 'finish', reason: { kind: 'max-tokens' } },
 ]
 
+/** The refusal the #7626 reporter's session answered every turn with, log line verbatim. */
+const REPORTED_413 = {
+  type: 'finish',
+  reason: {
+    kind: 'error',
+    failure: { code: 'INVALID_REQUEST', message: 'DeepSeek Messages request failed (413)', status: 413 },
+  },
+}
+
 class ScriptedAdapter extends LlmAdapter {
   constructor(chunks) {
     super()
@@ -55,11 +64,11 @@ async function drain(stream) {
 }
 
 /** Mount the harness pieces the plugin rides on; `withGuard = false` is a control arm. */
-async function harness(withGuard) {
+async function harness(withGuard, chunks = REPORTED_TURN) {
   const ctx = new Context()
   await ctx.plugin(LlmRuntime)
   if (withGuard) await ctx.plugin({ name: plugin.name, apply: plugin.apply }, {})
-  ctx.llm.registerAdapter([ROUTE.provider], new ScriptedAdapter(REPORTED_TURN))
+  ctx.llm.registerAdapter([ROUTE.provider], new ScriptedAdapter(chunks))
   return ctx
 }
 
@@ -165,4 +174,32 @@ test('the recovery stays bounded by maxOverflowRetries', async () => {
   // rather than a retry loop.
   assert.equal(await dispatch(finish.reason.failure), undefined)
   assert.equal(engine.calls.length, 1)
+})
+
+/* ------------------------------------------------------------------ *
+ * hop 3 — the same recovery, reached by a second route
+ * ------------------------------------------------------------------ */
+
+test('a size refusal reaches the recovery a truncation reaches', async () => {
+  // The classification is only worth anything if the built-in gate accepts it:
+  // this drives the real LlmRuntime and then the real compaction engine.
+  const finish = (await drain(streamOnce(await harness(true, [REPORTED_413])))).at(-1)
+  assert.equal(finish.reason.failure.code, CONTEXT_WINDOW_EXCEEDED_CODE)
+  const { engine, dispatch, agent } = await recoveryHarness()
+  const action = await dispatch(finish.reason.failure)
+  assert.equal(engine.calls.length, 1)
+  assert.equal(engine.calls[0].trigger, 'context-overflow')
+  assert.equal(action.kind, 'retry')
+  assert.equal(agent.session.surface.replaceGeneration, 1)
+})
+
+test('control: unmounted, the same refusal is the opaque INVALID_REQUEST the report describes', async () => {
+  // Both arms of #7626 in one place: without the plugin the code is one the
+  // recovery does not read, so nothing is compacted and no retry is requested —
+  // which is why the reported session could not send anything, ever again.
+  const finish = (await drain(streamOnce(await harness(false, [REPORTED_413])))).at(-1)
+  assert.equal(finish.reason.failure.code, 'INVALID_REQUEST')
+  const { engine, dispatch } = await recoveryHarness()
+  assert.equal(await dispatch(finish.reason.failure), undefined)
+  assert.equal(engine.calls.length, 0)
 })

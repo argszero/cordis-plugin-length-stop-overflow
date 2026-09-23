@@ -1,5 +1,6 @@
 # The @argszero/cordis-plugin-length-stop-overflow bundle patch.
-# Mounting needs no configuration: mode='error' by default.
+# Mounting needs no configuration: mode='error' by default. Both triggers below
+# are on by default; 'warn' reports without changing behaviour, 'off' disables.
 #
 #   - set:
 #       - id: length-stop-overflow
@@ -7,6 +8,7 @@
 #           mode: error                  # error | warn | off
 #           atMostOutputTokens: 2        # raise it if your backend clamps to a
 #                                        # small positive remainder instead of 1
+#           classifyOversizeRequests: true  # 413 / size-wording refusals
 #
 # What it guards (discussion #7214). A provider can answer "your request was too
 # large" without failing: it truncates and says `finish_reason: "length"`, which
@@ -56,8 +58,38 @@
 # output cap is the model's own (tens of thousands of tokens in the catalog). A
 # finish that carries no `usage` chunk is left alone (fail-closed).
 #
-# Start with mode='warn' to measure how often your own traffic hits the threshold
-# before letting it change behaviour.
+# What it guards, the second (discussion #7626). A session can also grow past
+# the provider's *transport* limit, in bytes, while every budget dsh computes
+# still reports headroom: dsh prices a request in tokens and never in bytes, and
+# the only byte budget in the LLM layer prices images. The provider then refuses
+# the request outright — HTTP 413 — and the classification order turns that into
+# the wrong code (llm-deepseek/src/transport.ts:31-33): a body-less 413 carries no
+# wording for isContextWindowExceededError to read, so the fallback string
+# 'DeepSeek Messages request failed (413)' falls through to INVALID_REQUEST.
+#
+#   compaction-basic/src/index.ts:180
+#     if (failure.code !== CONTEXT_WINDOW_EXCEEDED_CODE || signal.aborted) return next()
+#
+# Nothing recovers from INVALID_REQUEST — it is not in DEFAULT_RETRYABLE_CODES
+# (llm/src/retry-policy.ts:18-24), so the repeated 413s are re-issued turns — and
+# the summarization call that was supposed to reduce the session replays the same
+# oversized region and is refused too, so the session cannot send anything again.
+#
+# The second trigger reads size evidence instead of the code: the status itself,
+# the literal '413' in the failure text, or size wording on a request-rejection
+# code. INVALID_REQUEST holds malformed, forbidden and oversized requests
+# together, so the wording has to name size *and* name the request — a size
+# complaint about an image belongs to @deepseek-ai/dsh-compaction-image-offload,
+# and an 'aborted' finish is the caller's own decision, never a provider verdict.
+#
+# Where the summarization request is itself over the limit, no classification can
+# rescue the session; what changes is the label and the message (the provider's
+# own words, the status, the request id, and the measured size of the message
+# array). Where the region fits, the built-in recovery runs and the session
+# continues.
+#
+# Start with mode='warn' to measure how often your own traffic hits either
+# trigger before letting it change behaviour.
 
 - insert:
     - id: length-stop-overflow
