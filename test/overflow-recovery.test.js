@@ -67,7 +67,7 @@ async function drain(stream) {
 async function harness(withGuard, chunks = REPORTED_TURN) {
   const ctx = new Context()
   await ctx.plugin(LlmRuntime)
-  if (withGuard) await ctx.plugin({ name: plugin.name, apply: plugin.apply }, {})
+  if (withGuard) await ctx.plugin({ name: plugin.name, apply: plugin.apply, inject: plugin.inject }, {})
   ctx.llm.registerAdapter([ROUTE.provider], new ScriptedAdapter(chunks))
   return ctx
 }
@@ -133,7 +133,7 @@ async function recoveryHarness() {
   await ctx.plugin(SessionProjection)
   await ctx.plugin(TokenMeter)
   await ctx.plugin(SessionStore)
-  await ctx.plugin({ name: plugin.name, apply: plugin.apply }, {})
+  await ctx.plugin({ name: plugin.name, apply: plugin.apply, inject: plugin.inject }, {})
   await ctx.plugin(ProbeEngine, { auto: true })
   const engine = ctx.get('compaction')
   assert.ok(engine instanceof ProbeEngine, 'the real compaction backend must be mounted')

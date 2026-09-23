@@ -1,7 +1,7 @@
 # @argszero/cordis-plugin-length-stop-overflow
 
-**Two ways a provider refuses an over-long request without naming the reason —
-both read as something the harness does not recover from, both restored to the
+**Three ways a provider refuses an over-long request without naming the reason —
+all read as something the harness does not recover from, all restored to the
 overflow recovery that already exists.**
 
 A session can end turn after turn with **one** output token and never recover.
@@ -84,6 +84,59 @@ requests together, so the code alone is never sufficient — the wording has to
 name size *and* name the request (not, say, an image). See
 [What it will not claim](#what-it-will-not-claim).
 
+## The third defect (discussion #7632)
+
+Sometimes the provider says the right thing and the harness still cannot read
+it. A `usage`-based overflow sniff exists upstream, and it is one conjunct short
+of this case: pi-ai 0.85.1's `isContextOverflow` gates its usage branch on
+`message.stopReason === "stop"` (`dist/utils/overflow.js:140-145`), while a
+request refused for its length by a provider that does not name it answers
+`stopReason: "error"`. `llm-pi-ai` then ends at `PI_AI_ERROR`
+(`llm-pi-ai/src/stream.ts:42`), no wording matches the text fallback
+(`llm/src/error.ts:51-85`), and the recovery gate
+(`compaction-basic/src/index.ts:180`) never runs.
+
+(The fix for exactly this was merged upstream in `4791b40b26`, "fix(llm-pi-ai):
+classify usage-based context overflow" — it is an ancestor of the reporting
+build `dsh-v0.1.5-rc.2`. The conjunct above is what remains.)
+
+What is left, though, is the *provider's own arithmetic*: it counted this
+request's prompt tokens and found them at (or past) the window the route
+advertises. The plugin reads that count against that window:
+
+```
+error finish, nothing attributed, prompt >= saturationRatio x window
+    ->  { kind: 'error', failure: { code: 'CONTEXT_WINDOW_EXCEEDED', … } }
+```
+
+The failure it synthesizes keeps the provider's message verbatim and adds both
+numbers, so the rewrite is checkable against the session log:
+
+```
+openai/gpt-x failed as PI_AI_ERROR after the provider counted 192749 prompt
+token(s) against the 131072-token window that route advertises (1.47x): <the
+provider's own words>. Reclassified as CONTEXT_WINDOW_EXCEEDED by
+length-stop-overflow (discussion #7632): on a prompt this full the provider's
+own numbers name the reason, and the code it arrived with is one no recovery
+reads.
+```
+
+Two design notes make this rule safe to leave on by default:
+
+- **It needs no wording.** The other two rules read the provider's *shape*
+  (a `length` stop, a size noun); this one reads its *numbers*. That is why it
+  works on the case the upstream conjunct misses — a refusal whose text names
+  nothing at all.
+- **The window is resolved lazily.** It is the only input that costs a call
+  (`ctx.llm.resolveModelInfo`), so the wiring asks for it **only** after the
+  finish has been declined by both other rules *and* the failure alone has
+  passed every window-independent gate. A healthy turn never pays for it, and a
+  resolver that throws leaves the stream untouched (fail-closed, on purpose: the
+  guard may not become a new way for a turn to fail).
+
+`classifySaturatedFailures: false` turns this trigger off without touching the
+other two.
+
 ## What the plugin does
 
 Observes the public `llm/stream` waterfall and rewrites the terminal frame of
@@ -93,6 +146,7 @@ knows how to recover from:
 ```
 max-tokens finish              ->  { kind: 'error', failure: { code: 'CONTEXT_WINDOW_EXCEEDED', … } }
 error finish (size refusal)    ->  { kind: 'error', failure: { code: 'CONTEXT_WINDOW_EXCEEDED', … } }
+error finish (saturated prompt) -> { kind: 'error', failure: { code: 'CONTEXT_WINDOW_EXCEEDED', … } }
 ```
 
 `@deepseek-ai/dsh-compaction-basic` (mounted in `bundle/base` and
@@ -160,11 +214,15 @@ size rule is narrow on purpose. It never reclassifies:
   `@deepseek-ai/dsh-compaction-image-offload`, not to compaction;
 - a **token** bound (`input tokens exceeded max_prompt_tokens`) — a different
   budget, read by a different classifier;
+- an **unattributed failure on a prompt with room**: no `usage` chunk, a count
+  below `saturationRatio` of the window, a route whose capacity cannot be
+  resolved, or a capacity that is not a positive integer — all leave the
+  failure exactly as it arrived;
 - a rate limit, a transport failure, or a malformed request that merely mentions
   a size noun.
 
 `classifyOversizeRequests: false` turns the second trigger off without touching
-the first.
+the first; `classifySaturatedFailures: false` does the same for the third.
 
 ## What this does not fix
 
@@ -206,6 +264,8 @@ overlay):
         mode: error                      # error | warn | off   (default: error)
         atMostOutputTokens: 2            # default: 2
         classifyOversizeRequests: true   # default: true
+        classifySaturatedFailures: true  # default: true
+        saturationRatio: 0.99            # default: 0.99
 ```
 
 | option | meaning |
@@ -215,6 +275,14 @@ overlay):
 | `mode: 'off'` | pure pass-through |
 | `atMostOutputTokens` | output count at or below which a `max-tokens` finish is a truncation (default 2) |
 | `classifyOversizeRequests` | also reclassify a request refused for its size — `413`, or size wording on a request-rejection code (default `true`) |
+| `classifySaturatedFailures` | also reclassify an unattributed failure whose prompt count has reached the route's window (default `true`) |
+| `saturationRatio` | fraction of the resolved window at which that prompt count counts as saturated (default `0.99`) |
+
+Raise `saturationRatio`'s bar (e.g. `1.0`) if your route advertises a window far
+larger than it enforces; lower it if your provider refuses slightly *before* the
+window. The default sits just under 1.0 because a provider that counted a prompt
+this full and answered with an unattributed error has already told you what the
+prompt was worth.
 
 Raise `atMostOutputTokens` when a backend clamps the output budget to a small
 *positive* remainder instead of the floor: with a believed window of 262,144 and
@@ -232,11 +300,12 @@ together:
 | `overflow-classifier-guard` (#6361) | an **error** naming an input-token budget, in wording the classifier misses | `INVALID_REQUEST` |
 | `length-stop-overflow` (#7214) | **no error at all** — a `length` stop after one token | `max-tokens` |
 | `length-stop-overflow` ≥0.2.0 (#7626) | an **error** refusing the request for its size (413, no body) | `INVALID_REQUEST` |
+| `length-stop-overflow` ≥0.3.0 (#7632) | an **error** naming nothing, on a prompt the provider counted at the window | `PI_AI_ERROR` |
 
 ## Tests
 
 ```sh
-npm test        # tsc, then 77 tests over a real Cordis context
+npm test        # tsc, then 109 tests over a real Cordis context
 ```
 
 Three layers, each with a control arm, so a green run is evidence rather than an
@@ -251,7 +320,13 @@ accident:
   `compactIfNeeded`, and come back as `{ kind: 'retry' }` — while a foreign
   failure code compacts nothing, and a second overflow failure is terminal
   (hop 3: the same two arms for a size refusal, including the reported session's
-  exact `INVALID_REQUEST` — which compacts nothing without the plugin).
+  exact `INVALID_REQUEST` — which compacts nothing without the plugin; hop 4: the
+  saturation rule through a real mounted context — the reported turn and its
+  unmounted control, plus the arms where the route resolves no window, where the
+  capacity lookup is refused, and where the prompt has room. Hop 4 stops at the
+  waterfall on purpose: the failure it emits is the same
+  `CONTEXT_WINDOW_EXCEEDED_CODE` by value that hop 2 already proved passes the
+  recovery's gate, so a second compaction arm would re-measure hop 2's subject.)
 
 Plus a packaging guard asserting that the shipped artifact's bare imports and
 its runtime dependency declarations match in **both** directions.

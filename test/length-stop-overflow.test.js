@@ -21,21 +21,28 @@ import {
   classifyFinish,
   classifyLengthStop,
   classifyOversizeFailure,
+  classifySaturatedFailure,
   Config,
   DEFAULT_AT_MOST_OUTPUT_TOKENS,
   DEFAULT_CLASSIFY_OVERSIZE_REQUESTS,
+  DEFAULT_CLASSIFY_SATURATED_FAILURES,
   DEFAULT_MODE,
+  DEFAULT_SATURATION_RATIO,
   estimateRequestBytes,
   formatBytes,
   guardLengthStopStream,
   guardOverflowStream,
+  inject,
+  isAttributedStatus,
   isMaxTokensFinish,
   isRequestTooLargeFailure,
+  isSaturatedCandidate,
   name,
   overflowFailure,
   oversizeFailure,
   promptTokensOf,
   rewriteFinish,
+  saturationFailure,
 } from '../lib/index.js'
 
 /** Resolved-config shape the wiring always produces. */
@@ -44,6 +51,8 @@ function cfg(over = {}) {
     mode: 'error',
     atMostOutputTokens: DEFAULT_AT_MOST_OUTPUT_TOKENS,
     classifyOversizeRequests: DEFAULT_CLASSIFY_OVERSIZE_REQUESTS,
+    classifySaturatedFailures: DEFAULT_CLASSIFY_SATURATED_FAILURES,
+    saturationRatio: DEFAULT_SATURATION_RATIO,
     ...over,
   }
 }
@@ -363,13 +372,23 @@ test('Config applies every default', () => {
   assert.equal(resolved.mode, 'error')
   assert.equal(resolved.atMostOutputTokens, DEFAULT_AT_MOST_OUTPUT_TOKENS)
   assert.equal(resolved.classifyOversizeRequests, DEFAULT_CLASSIFY_OVERSIZE_REQUESTS)
+  assert.equal(resolved.classifySaturatedFailures, DEFAULT_CLASSIFY_SATURATED_FAILURES)
+  assert.equal(resolved.saturationRatio, DEFAULT_SATURATION_RATIO)
 })
 
 test('Config preserves explicit values', () => {
-  const resolved = Config({ mode: 'warn', atMostOutputTokens: 64, classifyOversizeRequests: false })
+  const resolved = Config({
+    mode: 'warn',
+    atMostOutputTokens: 64,
+    classifyOversizeRequests: false,
+    classifySaturatedFailures: false,
+    saturationRatio: 0.8,
+  })
   assert.equal(resolved.mode, 'warn')
   assert.equal(resolved.atMostOutputTokens, 64)
   assert.equal(resolved.classifyOversizeRequests, false)
+  assert.equal(resolved.classifySaturatedFailures, false)
+  assert.equal(resolved.saturationRatio, 0.8)
 })
 
 test('Config rejects an unknown mode', () => {
@@ -383,6 +402,12 @@ test('Config rejects a non-integer or negative threshold', () => {
 
 test('Config rejects a non-boolean oversize switch', () => {
   assert.throws(() => Config({ classifyOversizeRequests: 'yes' }))
+})
+
+test('Config rejects a switch that is not a boolean or a negative ratio', () => {
+  assert.throws(() => Config({ classifySaturatedFailures: 'yes' }))
+  assert.throws(() => Config({ saturationRatio: -0.1 }))
+  assert.throws(() => Config({ saturationRatio: 'a lot' }))
 })
 
 /* ------------------------------------------------------------------ *
@@ -402,17 +427,36 @@ class ScriptedAdapter extends LlmAdapter {
 }
 
 /**
+ * A scripted adapter that also resolves a context window, which is what a real
+ * provider adapter does (`resolveModel`) and what the saturation rule compares
+ * the provider's own count against.
+ */
+class WindowedAdapter extends ScriptedAdapter {
+  constructor(script, contextWindow = WINDOW) {
+    super(script)
+    this.contextWindow = contextWindow
+  }
+
+  resolveModel(provider, model) {
+    return Promise.resolve({ provider, id: model, name: model, context: { contextWindow: this.contextWindow } })
+  }
+}
+
+/**
  * Build the real service stack: a Cordis context, the real `LlmRuntime`, the
  * real `llm/stream` waterfall, and a scripted adapter registered on a route.
  * @param script - the chunks the adapter replays.
  * @param config - plugin config; the plugin is mounted when present.
+ * @param adapter - the adapter to register; defaults to one that resolves no
+ *   route metadata, which is also the arm that proves the saturation rule needs
+ *   a window to act.
  * @returns the context.
  */
-async function harness(script, config) {
+async function harness(script, config, adapter) {
   const ctx = new Context()
   await ctx.plugin(LlmRuntime)
-  if (config !== undefined) await ctx.plugin({ name, apply }, config)
-  ctx.llm.registerAdapter(['openrouter'], new ScriptedAdapter(script))
+  if (config !== undefined) await ctx.plugin({ name, apply, inject }, config)
+  ctx.llm.registerAdapter(['openrouter'], adapter ?? new ScriptedAdapter(script))
   return ctx
 }
 
@@ -464,7 +508,7 @@ test('the rewritten finish satisfies the harness\u2019 own stream invariant', as
   await ctx.plugin(InvariantRegistry)
   await ctx.plugin(LlmInvariant)
   await ctx.plugin(LlmRuntime)
-  await ctx.plugin({ name, apply }, {})
+  await ctx.plugin({ name, apply, inject }, {})
   ctx.llm.registerAdapter(['openrouter'], new ScriptedAdapter(REPORTED_TURN))
   const chunks = await streamOnce(ctx)
   assert.equal(chunks.at(-1).reason.failure.code, CONTEXT_WINDOW_EXCEEDED_CODE)
@@ -477,7 +521,7 @@ test('the invariant still rejects a broken stream while the plugin is mounted', 
   await ctx.plugin(InvariantRegistry)
   await ctx.plugin(LlmInvariant)
   await ctx.plugin(LlmRuntime)
-  await ctx.plugin({ name, apply }, {})
+  await ctx.plugin({ name, apply, inject }, {})
   ctx.llm.registerAdapter(['openrouter'], new ScriptedAdapter([
     { type: 'text-delta', index: 0, text: 'x' },
     maxTokensFinish(),
@@ -639,6 +683,298 @@ test('off mode does not even evaluate the size rule', async () => {
 })
 
 /* ------------------------------------------------------------------ *
+ * Trigger 3 — a saturated request failed as an unnamed error (#7632)
+ * ------------------------------------------------------------------ */
+
+/** The window the #7632 reporter configured on his route (`contextWindow: 131072`). */
+const WINDOW = 131072
+
+/**
+ * The reporter's third sample, verbatim: `input 7277 / cacheRead 185472 /
+ * output 16` is a 192,749-token prompt on a 131,072-token window — 1.47x — and
+ * the failure he saw on every turn, including the 102 summarization attempts.
+ */
+const SATURATED_TURN = [
+  { type: 'usage', usage: { inputTokens: 7277, outputTokens: 16, totalTokens: 192765, cacheReadTokens: 185472 } },
+  errorFinish({ code: 'PI_AI_ERROR', message: 'Response incomplete: length' }),
+]
+
+/** The reporter's first sample: 5486 + 166528 = 172,014 tokens, 1.31x. */
+const FIRST_SAMPLE_USAGE = {
+  type: 'usage',
+  usage: { inputTokens: 5486, outputTokens: 999, totalTokens: 173013, cacheReadTokens: 166528 },
+}
+
+/** A resolver that answers with the reported window, counting its calls. */
+function windowResolver(value = WINDOW) {
+  const calls = []
+  const resolve = async (provider, model) => {
+    calls.push(`${provider}/${model}`)
+    return value
+  }
+  resolve.calls = calls
+  return resolve
+}
+
+/** Drain one stream through the guard with a window resolver. */
+async function drainSaturated(chunks, config = cfg(), resolveWindow = windowResolver()) {
+  return drain(guardOverflowStream(from(chunks), config, ROUTE, undefined, undefined, resolveWindow))
+}
+
+test('the reported unnamed failure on a saturated prompt becomes CONTEXT_WINDOW_EXCEEDED', async () => {
+  const out = await drainSaturated(SATURATED_TURN)
+  const finish = out.at(-1)
+  assert.equal(finish.type, 'finish')
+  assert.equal(finish.reason.kind, 'error')
+  assert.equal(finish.reason.failure.code, CONTEXT_WINDOW_EXCEEDED_CODE)
+})
+
+test('the saturation failure names both the provider\u2019s count and the route\u2019s window', async () => {
+  const { failure } = (await drainSaturated(SATURATED_TURN)).at(-1).reason
+  assert.match(failure.message, /openrouter\/deepseek\/deepseek-v4\.1-flash/)
+  assert.match(failure.message, /192749 prompt token/)
+  assert.match(failure.message, /131072-token window/)
+  assert.match(failure.message, /1\.47x/)
+  // The provider's words survive: on this path the harness' own code named
+  // nothing, so the words are the only record of what the failing request said.
+  assert.match(failure.message, /Response incomplete: length/)
+  assert.match(failure.message, /PI_AI_ERROR/)
+  assert.match(failure.message, /length-stop-overflow/)
+  assert.match(failure.message, /7632/)
+})
+
+test('every reported sample classifies, including the least saturated one', async () => {
+  for (const [usage_, ratio] of [
+    [FIRST_SAMPLE_USAGE, 1.31],
+    [{ type: 'usage', usage: { inputTokens: 13671, outputTokens: 16, cacheReadTokens: 171904 } }, 1.42],
+    [SATURATED_TURN[0], 1.47],
+  ]) {
+    const out = await drainSaturated([usage_, errorFinish({ code: 'PI_AI_ERROR', message: 'Response incomplete: length' })])
+    assert.equal(out.at(-1).reason.failure.code, CONTEXT_WINDOW_EXCEEDED_CODE, `${ratio}x must classify`)
+    assert.match(out.at(-1).reason.failure.message, new RegExp(`${ratio}x`))
+  }
+})
+
+test('every non-terminal chunk is forwarded identically and in order', async () => {
+  const out = await drainSaturated(SATURATED_TURN)
+  assert.deepEqual(out.slice(0, -1), SATURATED_TURN.slice(0, -1))
+  assert.equal(out.length, SATURATED_TURN.length, 'no chunk may be added or dropped')
+})
+
+test('a prompt below the ratio is left alone', async () => {
+  // 0.92x of the window: large, but a provider that refuses *this* is refusing
+  // something other than the size, and compaction would spend a summarization
+  // call proving it.
+  const chunks = [{ type: 'usage', usage: { inputTokens: 100000, outputTokens: 16, cacheReadTokens: 20586 } }, ...SATURATED_TURN.slice(-1)]
+  assert.equal(promptTokensOf(chunks[0].usage), 120586)
+  assert.deepEqual(await drainSaturated(chunks), chunks)
+})
+
+test('the ratio is configurable and inclusive at its boundary', async () => {
+  const atWindow = [{ type: 'usage', usage: { inputTokens: WINDOW, outputTokens: 16 } }, ...SATURATED_TURN.slice(-1)]
+  const belowWindow = [{ type: 'usage', usage: { inputTokens: WINDOW - 1, outputTokens: 16 } }, ...SATURATED_TURN.slice(-1)]
+  const ratioOne = cfg({ saturationRatio: 1 })
+  assert.equal((await drainSaturated(atWindow, ratioOne)).at(-1).reason.failure.code, CONTEXT_WINDOW_EXCEEDED_CODE)
+  assert.deepEqual(await drainSaturated(belowWindow, ratioOne), belowWindow)
+  // Lowering it widens the rule deliberately: a gateway that refuses while a
+  // tenth of the window is still reported as headroom.
+  const halfFull = [{ type: 'usage', usage: { inputTokens: 65536, outputTokens: 16 } }, ...SATURATED_TURN.slice(-1)]
+  assert.deepEqual(await drainSaturated(halfFull, cfg({ saturationRatio: 0.99 })), halfFull)
+  assert.equal(
+    (await drainSaturated(halfFull, cfg({ saturationRatio: 0.5 }))).at(-1).reason.failure.code,
+    CONTEXT_WINDOW_EXCEEDED_CODE,
+  )
+})
+
+test('an attributed failure is never reclassified, however full the prompt', async () => {
+  // The rule's whole licence is that the code named nothing. A code that names a
+  // cause rules a size refusal out (or owns its own recovery).
+  const codes = [
+    'AUTH', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT', 'STREAM_CLOSED', 'ABORTED',
+    'QUOTA', 'EMPTY_RESPONSE', 'INVALID_CREDENTIAL', 'INVARIANT', 'INVALID_ARGS', 'NO_ADAPTER',
+    CONTEXT_WINDOW_EXCEEDED_CODE, 'IMAGE_OFFLOAD_REQUIRED',
+  ]
+  for (const code of codes) {
+    const chunks = [SATURATED_TURN[0], errorFinish({ code, message: 'whatever the provider said' })]
+    const out = await drainSaturated(chunks)
+    assert.deepEqual(out, chunks, `${code} must be left alone`)
+  }
+})
+
+test('a status that attributes the failure rules the rule out too', async () => {
+  // Independent evidence: a provider refuses an oversized request with a 4xx
+  // that says so, and a 5xx/429/408/401/403 is its health, its throttle, or a
+  // credential. `PI_AI_ERROR` would otherwise be admissible.
+  for (const status of [500, 502, 503, 504, 429, 408, 401, 403]) {
+    const chunks = [SATURATED_TURN[0], errorFinish({ code: 'PI_AI_ERROR', message: 'Response incomplete: length', status })]
+    assert.deepEqual(await drainSaturated(chunks), chunks, `HTTP ${status} must be left alone`)
+    assert.equal(isAttributedStatus(status), true)
+  }
+  for (const status of [400, 404, 413, 422]) {
+    assert.equal(isAttributedStatus(status), false, `HTTP ${status} does not attribute a cause`)
+  }
+  assert.equal(isAttributedStatus(undefined), false)
+})
+
+test('INVALID_REQUEST is admitted, because it attributes nothing', async () => {
+  // The size rule needs wording on this code because the code is a bag; on a
+  // saturated prompt the numbers are the evidence the wording was supposed to
+  // provide, which is the whole point of reading usage.
+  const failure = { code: 'INVALID_REQUEST', message: '400 Bad Request' }
+  const chunks = [SATURATED_TURN[0], errorFinish(failure)]
+  const out = await drainSaturated(chunks)
+  assert.equal(out.at(-1).reason.failure.code, CONTEXT_WINDOW_EXCEEDED_CODE)
+  // Contrast: the same failure on a prompt with room is left alone, which is the
+  // arm the size rule would also take (no size wording anywhere in the message).
+  const roomy = [{ type: 'usage', usage: { inputTokens: 1024, outputTokens: 16 } }, errorFinish(failure)]
+  assert.deepEqual(await drainSaturated(roomy), roomy)
+})
+
+test('a failure with no usage chunk fails closed', async () => {
+  const chunks = [errorFinish({ code: 'PI_AI_ERROR', message: 'Response incomplete: length' })]
+  assert.deepEqual(await drainSaturated(chunks), chunks)
+})
+
+test('an unresolvable window fails closed', async () => {
+  // `GenerateOptions` carries no window, so a route whose adapter reports none
+  // leaves the rule with nothing to compare against. The finished stream keeps
+  // the code the adapter chose.
+  assert.deepEqual(await drainSaturated(SATURATED_TURN, cfg(), async () => undefined), SATURATED_TURN)
+})
+
+test('a resolver that throws propagates — failing closed is the wiring\u2019s job', async () => {
+  // The generator stays a pure function of its inputs; `apply` is where an
+  // adapter lookup is caught and turned into `undefined`.
+  await assert.rejects(
+    drainSaturated(SATURATED_TURN, cfg(), async () => { throw new Error('NO_ADAPTER') }),
+    /NO_ADAPTER/,
+  )
+})
+
+test('a max-tokens finish never reaches the saturation rule', async () => {
+  // The truncation rule owns that shape. If saturation could claim it, raising
+  // `saturationRatio` would silently widen rule 1 to any output count.
+  const resolve = windowResolver()
+  const chunks = [SATURATED_TURN[0], maxTokensFinish()]
+  assert.deepEqual(await drainSaturated(chunks, cfg(), resolve), chunks)
+  assert.deepEqual(resolve.calls, [], 'the window must not even be resolved')
+})
+
+test('a successful stop is never reclassified, whatever the prompt says', async () => {
+  const resolve = windowResolver()
+  const chunks = [SATURATED_TURN[0], { type: 'finish', reason: { kind: 'stop' } }]
+  assert.deepEqual(await drainSaturated(chunks, cfg(), resolve), chunks)
+  assert.deepEqual(resolve.calls, [])
+})
+
+test('the window is resolved only when the cheap gates pass', async () => {
+  // Resolving costs an adapter call, so the rule runs last and pays only when it
+  // can still change the verdict.
+  const attributed = windowResolver()
+  await drainSaturated([SATURATED_TURN[0], errorFinish({ code: 'SERVER', message: 'HTTP 500' })], cfg(), attributed)
+  assert.deepEqual(attributed.calls, [], 'an attributed code must not resolve a window')
+
+  const noUsage = windowResolver()
+  await drainSaturated([errorFinish({ code: 'PI_AI_ERROR', message: 'Response incomplete: length' })], cfg(), noUsage)
+  assert.deepEqual(noUsage.calls, [], 'no provider count, nothing to compare')
+
+  const declined = windowResolver()
+  await drainSaturated([{ type: 'usage', usage: { inputTokens: 1024, outputTokens: 4 } }, ...SATURATED_TURN.slice(-1)], cfg(), declined)
+  assert.deepEqual(declined.calls, [`${ROUTE.provider}/${ROUTE.model}`], 'resolved once, then declined on the comparison')
+
+  const claimed = windowResolver()
+  await drainSaturated([REPORTED_413], cfg(), claimed)
+  assert.deepEqual(claimed.calls, [], 'a finish another rule already claimed never resolves one')
+
+  const saturated = windowResolver()
+  await drainSaturated(SATURATED_TURN, cfg(), saturated)
+  assert.deepEqual(saturated.calls, [`${ROUTE.provider}/${ROUTE.model}`])
+})
+
+test('the saturation rule can be switched off entirely', async () => {
+  const resolve = windowResolver()
+  const out = await drainSaturated(SATURATED_TURN, cfg({ classifySaturatedFailures: false }), resolve)
+  assert.deepEqual(out, SATURATED_TURN)
+  assert.deepEqual(resolve.calls, [], 'switched off means not even evaluated')
+})
+
+test('warn mode reports the saturation evidence without changing the stream', async () => {
+  const seen = []
+  const out = await drain(guardOverflowStream(from(SATURATED_TURN), WARN, ROUTE, (d) => seen.push(d), undefined, windowResolver()))
+  assert.deepEqual(out, SATURATED_TURN)
+  assert.equal(seen.length, 1)
+  assert.deepEqual(seen[0], {
+    rule: 'context-saturated',
+    promptTokens: 192749,
+    contextWindow: WINDOW,
+    code: 'PI_AI_ERROR',
+    providerMessage: 'Response incomplete: length',
+  })
+})
+
+test('off mode does not even resolve a window', async () => {
+  const resolve = windowResolver()
+  assert.deepEqual(await drainSaturated(SATURATED_TURN, OFF, resolve), SATURATED_TURN)
+  assert.deepEqual(resolve.calls, [])
+})
+
+test('a rewritten saturation failure still carries exactly one terminal frame', async () => {
+  const out = await drainSaturated(SATURATED_TURN)
+  assert.equal(out.filter((chunk) => chunk.type === 'finish').length, 1)
+  assert.equal(out.at(-1).type, 'finish')
+})
+
+test('rewriteFinish routes a saturation detection to its own failure text', () => {
+  const detection = classifySaturatedFailure(
+    SATURATED_TURN[1].reason.failure,
+    SATURATED_TURN[0].usage,
+    WINDOW,
+    cfg(),
+  )
+  assert.equal(detection.rule, 'context-saturated')
+  const rewritten = rewriteFinish(SATURATED_TURN[1], detection, ROUTE)
+  assert.equal(rewritten.reason.failure.code, CONTEXT_WINDOW_EXCEEDED_CODE)
+  assert.equal(rewritten.reason.failure.message, saturationFailure(detection, ROUTE).message)
+})
+
+/* ------------------------------------------------------------------ *
+ * The saturation rule's own units
+ * ------------------------------------------------------------------ */
+
+test('isSaturatedCandidate answers the window-independent gates', () => {
+  const usage = SATURATED_TURN[0].usage
+  const unattributed = { code: 'PI_AI_ERROR', message: 'Response incomplete: length' }
+  assert.equal(isSaturatedCandidate(unattributed, usage, cfg()), true)
+  assert.equal(isSaturatedCandidate(unattributed, undefined, cfg()), false, 'no provider count')
+  assert.equal(isSaturatedCandidate({ code: 'RATE_LIMIT', message: '429' }, usage, cfg()), false)
+  assert.equal(isSaturatedCandidate({ ...unattributed, status: 503 }, usage, cfg()), false)
+  assert.equal(isSaturatedCandidate(unattributed, usage, cfg({ classifySaturatedFailures: false })), false)
+  // A usage whose counts are not numbers has nothing to compare.
+  assert.equal(isSaturatedCandidate(unattributed, { inputTokens: Number.NaN, outputTokens: 0 }, cfg()), false)
+})
+
+test('classifySaturatedFailure refuses a window it cannot trust', () => {
+  const failure = SATURATED_TURN[1].reason.failure
+  const usage = SATURATED_TURN[0].usage
+  for (const window of [undefined, 0, -1, 1.5, Number.NaN]) {
+    assert.equal(classifySaturatedFailure(failure, usage, window, cfg()), null, `window ${window}`)
+  }
+  assert.notEqual(classifySaturatedFailure(failure, usage, WINDOW, cfg()), null)
+})
+
+test('the saturation evidence carries the status and the request id when there are any', () => {
+  const detection = classifySaturatedFailure(
+    { code: 'PI_AI_ERROR', message: 'Response incomplete: length', status: 400, requestId: 'req_123' },
+    SATURATED_TURN[0].usage,
+    WINDOW,
+    cfg(),
+  )
+  assert.equal(detection.status, 400)
+  assert.equal(detection.requestId, 'req_123')
+  assert.equal('status' in saturationFailure({ ...detection, status: undefined }, ROUTE), false)
+})
+
+/* ------------------------------------------------------------------ *
  * The byte measurement
  * ------------------------------------------------------------------ */
 
@@ -749,7 +1085,7 @@ test('the rewritten refusal satisfies the harness\u2019 own stream invariant', a
   await ctx.plugin(InvariantRegistry)
   await ctx.plugin(LlmInvariant)
   await ctx.plugin(LlmRuntime)
-  await ctx.plugin({ name, apply }, {})
+  await ctx.plugin({ name, apply, inject }, {})
   ctx.llm.registerAdapter(['openrouter'], new ScriptedAdapter([REPORTED_413]))
   const chunks = await streamOnce(ctx)
   assert.equal(chunks.at(-1).reason.failure.code, CONTEXT_WINDOW_EXCEEDED_CODE)
@@ -759,4 +1095,97 @@ test('the plugin is a pass-through for a 413 when disabled through a real mount'
   const ctx = await harness([REPORTED_413], { classifyOversizeRequests: false })
   const finish = (await streamOnce(ctx)).at(-1)
   assert.equal(finish.reason.failure.code, 'INVALID_REQUEST')
+})
+
+/* ------------------------------------------------------------------ *
+ * Integration: the saturated, unnamed failure through the real waterfall
+ * ------------------------------------------------------------------ */
+
+test('mounted in a real context, the reported turn reaches the caller as CONTEXT_WINDOW_EXCEEDED', async () => {
+  // Hop 1 of #7632 through the real runtime: the route resolves its window the
+  // way a real adapter does, and the provider's own count saturates it.
+  const ctx = await harness(SATURATED_TURN, {}, new WindowedAdapter(SATURATED_TURN))
+  const finish = (await streamOnce(ctx)).at(-1)
+  assert.equal(finish.reason.kind, 'error')
+  assert.equal(finish.reason.failure.code, CONTEXT_WINDOW_EXCEEDED_CODE)
+  assert.match(finish.reason.failure.message, /192749 prompt token/)
+  assert.match(finish.reason.failure.message, /discussion #7632/)
+})
+
+test('control: unmounted, the same turn is the opaque PI_AI_ERROR the report describes', async () => {
+  const ctx = await harness(SATURATED_TURN, undefined, new WindowedAdapter(SATURATED_TURN))
+  const finish = (await streamOnce(ctx)).at(-1)
+  assert.equal(finish.reason.kind, 'error')
+  assert.equal(finish.reason.failure.code, 'PI_AI_ERROR')
+  assert.equal(finish.reason.failure.message, 'Response incomplete: length')
+})
+
+test('control: mounted, a route that resolves no window leaves the code alone', async () => {
+  // The base adapter's `resolveModel` answer (and a scripted adapter's), which is
+  // also what an adapter that knows nothing about the route returns: no capacity,
+  // no verdict. Fail-closed, measured through the real waterfall.
+  const ctx = await harness(SATURATED_TURN, {})
+  const finish = (await streamOnce(ctx)).at(-1)
+  assert.equal(finish.reason.failure.code, 'PI_AI_ERROR')
+})
+
+test('mounted, a route whose capacity lookup fails leaves the code alone', async () => {
+  // The wiring catches a rejecting lookup rather than letting it break the
+  // stream. The runtime resolves the route before dispatching (`prepareCall`),
+  // so only the second lookup — the guard's — fails here; the assertion on the
+  // count keeps that ordering explicit instead of implied.
+  class FlakyLookupAdapter extends ScriptedAdapter {
+    calls = 0
+
+    resolveModel(provider, model) {
+      this.calls += 1
+      if (this.calls > 1) return Promise.reject(new Error('NO_ADAPTER: unknown route'))
+      return Promise.resolve({ provider, id: model, name: model, context: { contextWindow: WINDOW } })
+    }
+  }
+  const adapter = new FlakyLookupAdapter(SATURATED_TURN)
+  const ctx = await harness(SATURATED_TURN, {}, adapter)
+  const finish = (await streamOnce(ctx)).at(-1)
+  assert.equal(finish.reason.failure.code, 'PI_AI_ERROR')
+  assert.equal(adapter.calls, 2, 'the guard must have asked, and been refused')
+})
+
+test('mounted, a failure on a prompt with room is untouched through the real waterfall', async () => {
+  const roomy = [{ type: 'usage', usage: { inputTokens: 1024, outputTokens: 16 } }, ...SATURATED_TURN.slice(-1)]
+  const ctx = await harness(roomy, {}, new WindowedAdapter(roomy))
+  const finish = (await streamOnce(ctx)).at(-1)
+  assert.equal(finish.reason.failure.code, 'PI_AI_ERROR')
+})
+
+test('a server failure on a saturated prompt is untouched through the real waterfall', async () => {
+  // The adversarial shape for this rule: the numbers say saturated and the code
+  // says the provider broke. The code wins, because its recovery is the retry
+  // policy's and a compaction would not fix a 500.
+  const chunks = [SATURATED_TURN[0], errorFinish({ code: 'SERVER', message: 'HTTP 500' })]
+  const ctx = await harness(chunks, {}, new WindowedAdapter(chunks))
+  const finish = (await streamOnce(ctx)).at(-1)
+  assert.equal(finish.reason.failure.code, 'SERVER')
+})
+
+test('the rewritten saturation failure satisfies the harness\u2019 own stream invariant', async () => {
+  const ctx = new Context()
+  await ctx.plugin(InvariantRegistry)
+  await ctx.plugin(LlmInvariant)
+  await ctx.plugin(LlmRuntime)
+  await ctx.plugin({ name, apply, inject }, {})
+  ctx.llm.registerAdapter(['openrouter'], new WindowedAdapter(SATURATED_TURN))
+  const chunks = await streamOnce(ctx)
+  assert.equal(chunks.at(-1).reason.failure.code, CONTEXT_WINDOW_EXCEEDED_CODE)
+})
+
+test('a mount that drops the module\u2019s inject declaration fails loudly', async () => {
+  // Measured, not assumed. `inject` rides on the plugin *object* handed to
+  // `ctx.plugin` — the module namespace the loader imports — so a hand-rolled
+  // mount that spreads only `{ name, apply }` loses it, and cordis then refuses
+  // the service read ("cannot get property 'llm' without inject"). Reading it at
+  // wiring time turns that into a mount error; reading it lazily would have left
+  // the saturation rule dead inside every stream, reporting nothing.
+  const ctx = new Context()
+  await ctx.plugin(LlmRuntime)
+  await assert.rejects(async () => { await ctx.plugin({ name, apply }, {}) }, /without inject/)
 })

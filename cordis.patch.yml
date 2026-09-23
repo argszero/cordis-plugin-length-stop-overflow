@@ -1,6 +1,7 @@
 # The @argszero/cordis-plugin-length-stop-overflow bundle patch.
-# Mounting needs no configuration: mode='error' by default. Both triggers below
-# are on by default; 'warn' reports without changing behaviour, 'off' disables.
+# Mounting needs no configuration: mode='error' by default. All three triggers
+# below are on by default; 'warn' reports without changing behaviour, 'off'
+# disables.
 #
 #   - set:
 #       - id: length-stop-overflow
@@ -8,7 +9,9 @@
 #           mode: error                  # error | warn | off
 #           atMostOutputTokens: 2        # raise it if your backend clamps to a
 #                                        # small positive remainder instead of 1
-#           classifyOversizeRequests: true  # 413 / size-wording refusals
+#           classifyOversizeRequests: true   # 413 / size-wording refusals
+#           classifySaturatedFailures: true  # window-full prompts, unnamed
+#           saturationRatio: 0.99            # how full counts as full
 #
 # What it guards (discussion #7214). A provider can answer "your request was too
 # large" without failing: it truncates and says `finish_reason: "length"`, which
@@ -88,8 +91,33 @@
 # array). Where the region fits, the built-in recovery runs and the session
 # continues.
 #
-# Start with mode='warn' to measure how often your own traffic hits either
-# trigger before letting it change behaviour.
+# What it guards, the third (discussion #7632). A provider can also refuse a
+# request for its length while naming nothing: the answer is an `error` finish
+# whose code ends at PI_AI_ERROR, and no wording matches the text fallback
+# (llm/src/error.ts:51-85), so the recovery gate above never runs and the session
+# repeats the same over-long request. A usage-based sniff for exactly this exists
+# upstream and is one conjunct short — pi-ai's isContextOverflow gates its usage
+# branch on `message.stopReason === "stop"`
+# (pi-ai/dist/utils/overflow.js:140-145), while this answer carries "error".
+#
+# What is left is the provider's own arithmetic: it counted this request's prompt
+# tokens (inputTokens + cacheReadTokens + cacheWriteTokens) against the window the
+# route advertises, resolved at the llm/stream seam through
+# ctx.llm.resolveModelInfo(...).context.contextWindow. Reaching saturationRatio
+# (default 0.99) of that window, on a failure nothing else attributed, is an
+# overflow the harness could not name. The synthesized failure keeps the
+# provider's message verbatim and adds both numbers, so the rewrite is checkable
+# against the session log.
+#
+# The window lookup is the only input that costs a call, so the wiring asks for
+# it only after both other rules declined the finish AND the failure alone passed
+# every window-independent gate; a healthy turn never pays for it. A resolver that
+# throws leaves the stream untouched — the guard may not become a new way for a
+# turn to fail, and the alternatives (assume a window, trust a usage chunk that
+# never arrived) would claim failures this plugin cannot substantiate.
+#
+# Start with mode='warn' to measure how often your own traffic hits any trigger
+# before letting it change behaviour.
 
 - insert:
     - id: length-stop-overflow

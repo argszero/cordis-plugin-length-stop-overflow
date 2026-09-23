@@ -1,9 +1,9 @@
 /**
  * Length-stop overflow guard for the dsh harness.
  *
- * Two ways a provider can reject an over-long request without ever saying
- * "context window exceeded". Both leave the session unable to make progress,
- * and both are repaired here by restoring the one classification the built-in
+ * Three ways a provider can reject an over-long request without ever saying
+ * "context window exceeded". Each leaves the session unable to make progress,
+ * and each is repaired here by restoring the one classification the built-in
  * recovery keys on.
  *
  * ## Trigger 1 — a truncation reported as an ordinary output cap (#7214)
@@ -77,6 +77,46 @@
  * wording has to name size, and the wording has to name *the request* (not, say,
  * an image) — see {@link isRequestTooLargeFailure}.
  *
+ * ## Trigger 3 — a saturated request failed as an unnamed error (#7632)
+ *
+ * The third shape is an outright **failure** whose code names nothing in
+ * particular. The reported case (discussion #7632) is a session on
+ * `api: openai-responses` whose provider answered every request — including the
+ * 102 summarization attempts that were supposed to shrink it — with
+ * `{"message":"Response incomplete: length","code":"PI_AI_ERROR"}`, until the
+ * turn died the same way forever.
+ *
+ * The chain that produces that code is upstream of this plugin and stays there:
+ *
+ * 1. pi-ai 0.85.1 maps an `incomplete_details.reason` other than
+ *    `max_output_tokens` to `{ stopReason: 'error', errorMessage: 'Response
+ *    incomplete: length' }` (`dist/api/openai-responses-shared.js:660-688`).
+ * 2. pi-ai's own overflow sniff then misses it: the wording branch is looking at
+ *    `stopReason === 'error'` but has no pattern for pi-ai's own sentence, and
+ *    the usage branch that would catch it is gated on a `stopReason` this
+ *    message does not have.
+ * 3. `dsh-llm`'s text fallback requires explicit context wording
+ *    (`llm/src/error.ts:51-85`), which `Response incomplete: length` does not
+ *    contain, so `llm-pi-ai` falls through to `PI_AI_ERROR`
+ *    (`llm-pi-ai/src/stream.ts:64-73`).
+ * 4. No recovery reads `PI_AI_ERROR`: the overflow leg of `agent/request-error`
+ *    requires `CONTEXT_WINDOW_EXCEEDED` (`compaction-basic/src/index.ts:194`).
+ *
+ * What the harness *does* hold here is the provider's own accounting. The
+ * adapter yields the `usage` chunk before the terminal finish on the `error`
+ * path as well as the `done` path (`llm-pi-ai/src/stream.ts:222-228`), and the
+ * reported turn's `{ input 5486, cacheRead 166528 }` is **172,014** prompt tokens
+ * against the 131,072-token window that route advertises — 1.31x, with 16 to 999
+ * output tokens. A prompt that fills the window, delivered as a failure nobody
+ * named, is an overflow by arithmetic, and it is the provider's arithmetic.
+ *
+ * So this trigger compares the provider's own count against the window the
+ * adapter resolves through the public `ctx.llm.resolveModelInfo`
+ * (`llm/src/index.ts:734-740`) — the same resolution the adapter and
+ * `dsh-compaction-basic` use — and reads a saturated prompt as the reason. See
+ * {@link classifySaturatedFailure} for the gates that keep it from swallowing a
+ * failure something else already explains.
+ *
  * ## What it does
  *
  * Observes the public `llm/stream` waterfall and rewrites the terminal frame
@@ -112,12 +152,24 @@
  *
  * A finish with no `usage` chunk is left alone (fail-closed): without the
  * provider's own count there is nothing to judge. That rule applies to the
- * length-stop rule only — a request rejection carries no usage chunk at all.
+ * length-stop and saturation rules alike — a request rejection carries no usage
+ * chunk at all, which is why the size rule never asks for one.
  *
  * The size rule deliberately does not touch `aborted` finishes (the caller
  * stopped us), failures whose code another recovery already owns
  * (`CONTEXT_WINDOW_EXCEEDED` itself, `IMAGE_OFFLOAD_REQUIRED`), or size
  * complaints aimed at something other than the request.
+ *
+ * The saturation rule is the narrowest of the three, because it is the only one
+ * that reads a *general* failure as an overflow. It fires only on an `error`
+ * finish whose code the harness did not already attribute to another cause —
+ * authentication, quota, rate limit, server, timeout, transport, degenerate
+ * completion, credentials and the harness' own programming errors are all
+ * excluded ({@link ATTRIBUTED_CODES}) — and only when the provider's own prompt
+ * count reaches `saturationRatio` of the resolved window. It is fail-closed
+ * twice: no count, or no resolved window, and nothing happens. `max-tokens`
+ * finishes are untouched by it, so raising the ratio can never widen the
+ * truncation rule behind an operator's back.
  *
  * @module @argszero/cordis-plugin-length-stop-overflow
  */
@@ -136,9 +188,15 @@ import type {
   TokenUsage,
 } from '@deepseek-ai/dsh-llm'
 // Value imports: the harness' own codes, so this plugin and the core can never
-// disagree about which failure the recovery path keys on, nor about which code
-// already owns a recovery of its own.
-import { CONTEXT_WINDOW_EXCEEDED_CODE, IMAGE_OFFLOAD_REQUIRED_CODE } from '@deepseek-ai/dsh-llm'
+// disagree about which failure the recovery path keys on, nor about which codes
+// already name a cause whose recovery is somebody else's.
+import {
+  CONTEXT_WINDOW_EXCEEDED_CODE,
+  EMPTY_RESPONSE_CODE,
+  IMAGE_OFFLOAD_REQUIRED_CODE,
+  INVALID_CREDENTIAL_CODE,
+  QUOTA_EXCEEDED_CODE,
+} from '@deepseek-ai/dsh-llm'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'length-stop-overflow'
@@ -176,6 +234,32 @@ export const DEFAULT_MODE = 'error'
  */
 export const DEFAULT_CLASSIFY_OVERSIZE_REQUESTS = true
 
+/**
+ * Whether an unnamed failure on a window-saturated prompt is reclassified too
+ * (default).
+ *
+ * On by default for the same reason the size rule is: the alternative is a
+ * session that dies on every turn reporting a code no recovery reads, and the
+ * user has no way to shrink it from there. Turn it off to keep the plugin
+ * exactly as it was before 0.3.0.
+ */
+export const DEFAULT_CLASSIFY_SATURATED_FAILURES = true
+
+/**
+ * Fraction of the resolved context window at which a prompt counts as saturated.
+ *
+ * `0.99` is the reporter's own number (discussion #7632) and the same one pi-ai
+ * uses for its usage branch: it fires when the prompt has essentially no room
+ * left, not when it is merely large. A ratio rather than an absolute count,
+ * because the window is a property of the route — one number has to serve a 32k
+ * model and a 1M one.
+ *
+ * Raise it to `1` to act only on a prompt the provider itself counted as *over*
+ * the window; lower it when a gateway starts refusing requests while a small
+ * remainder is still being reported as headroom.
+ */
+export const DEFAULT_SATURATION_RATIO = 0.99
+
 /** Plugin configuration. */
 export interface Config {
   /**
@@ -201,6 +285,17 @@ export interface Config {
    * Default `true`.
    */
   classifyOversizeRequests?: boolean
+  /**
+   * Whether an `error` finish whose code names no other cause, on a prompt the
+   * provider counted as filling the resolved window, is reclassified as
+   * `CONTEXT_WINDOW_EXCEEDED`. Default `true`.
+   */
+  classifySaturatedFailures?: boolean
+  /**
+   * Fraction of the resolved context window at or above which the provider's own
+   * prompt count reads as saturated. Default 0.99.
+   */
+  saturationRatio?: number
 }
 
 /** Resolved config: every field carries its validated default. */
@@ -210,6 +305,8 @@ export const Config: z<Config> = z.object({
   mode: z.union(['error', 'warn', 'off']).default(DEFAULT_MODE),
   atMostOutputTokens: z.natural().default(DEFAULT_AT_MOST_OUTPUT_TOKENS),
   classifyOversizeRequests: z.boolean().default(DEFAULT_CLASSIFY_OVERSIZE_REQUESTS),
+  classifySaturatedFailures: z.boolean().default(DEFAULT_CLASSIFY_SATURATED_FAILURES),
+  saturationRatio: z.number().min(0).default(DEFAULT_SATURATION_RATIO),
 })
 
 /**
@@ -280,8 +377,33 @@ export interface OversizeEvidence {
   requestBytes?: number
 }
 
+/**
+ * What a window-saturated, unattributed failure looked like, for the log line
+ * and the failure text.
+ *
+ * Both numbers are the provider's and the route's, never estimates: the prompt
+ * count is the usage the adapter reported and the window is what the adapter
+ * resolved for the same route the request went to.
+ */
+export interface SaturationEvidence {
+  /** Discriminant: this detection came from a saturated prompt on a failure nothing attributed. */
+  rule: 'context-saturated'
+  /** Prompt tokens the provider counted for the failed request (uncached input plus both cache fields). */
+  promptTokens: number
+  /** Context capacity the route advertises, as the adapter resolved it. */
+  contextWindow: number
+  /** The code the harness reported, which this rule read as an attribution to nothing. */
+  code: string
+  /** The provider's own message, verbatim — the only durable trace of what it said. */
+  providerMessage: string
+  /** HTTP status the adapter reported, when it reported one. */
+  status?: number
+  /** Request identifier the adapter reported, when it reported one. */
+  requestId?: ProviderRequestId
+}
+
 /** One reclassification this guard performed (or, in `warn` mode, would have performed). */
-export type OverflowDetection = TruncationEvidence | OversizeEvidence
+export type OverflowDetection = TruncationEvidence | OversizeEvidence | SaturationEvidence
 
 /**
  * Whether one terminal finish is a truncation rather than an output cap.
@@ -329,6 +451,73 @@ const RECOVERY_OWNED_CODES: ReadonlySet<string> = new Set([
   CONTEXT_WINDOW_EXCEEDED_CODE,
   IMAGE_OFFLOAD_REQUIRED_CODE,
 ])
+
+/**
+ * Codes whose cause is already named — the mirror image of
+ * {@link RECOVERY_OWNED_CODES}, for the rule that reads a *general* failure as an
+ * overflow.
+ *
+ * The harness attaches these when it has attributed the failure, and every one
+ * of them either rules a size refusal out or owns a response of its own:
+ *
+ * - `QUOTA`, `EMPTY_RESPONSE` — billing, and a degenerate completion; neither is
+ *   about how much was sent, and both have handling of their own.
+ * - `AUTH`, `INVALID_CREDENTIAL` — a credential error does not shrink.
+ * - `RATE_LIMIT`, `SERVER`, `TIMEOUT`, `TRANSPORT`, `STREAM_CLOSED` — the adapter
+ *   attributing the failure to the wire or to the provider's health, which the
+ *   retry policy owns; a compaction here would spend a summarization call on a
+ *   request that fails identically.
+ * - `INVARIANT`, `INVALID_ARGS`, `NO_ADAPTER`, `INVALID_MODEL_*` — the harness'
+ *   own programming errors; reclassifying one would hide a bug behind a
+ *   compaction.
+ *
+ * `ABORTED` is here for completeness although the rule only ever sees `error`
+ * finishes.
+ *
+ * `INVALID_REQUEST` is **deliberately absent**: it is the bag that holds
+ * malformed, forbidden and oversized requests together (see
+ * {@link isRequestTooLargeFailure}), so it attributes nothing. On a saturated
+ * prompt the provider's own numbers are the only evidence available, and they
+ * are evidence *for* this rule — which is exactly what the size rule would
+ * otherwise have to read out of wording the provider never sent.
+ */
+const ATTRIBUTED_CODES: ReadonlySet<string> = new Set([
+  CONTEXT_WINDOW_EXCEEDED_CODE,
+  IMAGE_OFFLOAD_REQUIRED_CODE,
+  QUOTA_EXCEEDED_CODE,
+  EMPTY_RESPONSE_CODE,
+  INVALID_CREDENTIAL_CODE,
+  'ABORTED',
+  'AUTH',
+  'RATE_LIMIT',
+  'SERVER',
+  'TIMEOUT',
+  'TRANSPORT',
+  'STREAM_CLOSED',
+  'INVARIANT',
+  'INVALID_ARGS',
+  'NO_ADAPTER',
+  'INVALID_MODEL_INFO',
+  'INVALID_MODEL_CONTEXT',
+  'INVALID_MODEL_MAX_TOKENS',
+])
+
+/**
+ * Whether a reported status attributes the failure to something other than size.
+ *
+ * Providers refuse an oversized request with a 4xx that says so; a 5xx is the
+ * provider's own health, 429 its throttling, 408 a timeout, and 401/403 a
+ * credential. The adapter's own `code` already carries most of these, but a
+ * status is independent evidence and costs nothing to read.
+ *
+ * @param status - the HTTP status the adapter reported, when it reported one.
+ * @returns `true` when the status rules a size refusal out.
+ */
+export function isAttributedStatus(status: number | undefined): boolean {
+  if (status === undefined) return false
+  if (status >= 500) return true
+  return status === 401 || status === 403 || status === 408 || status === 429
+}
 
 /**
  * Nouns that name what we send.
@@ -403,10 +592,94 @@ export function classifyOversizeFailure(reason: FinishReason, config: ResolvedCo
 }
 
 /**
+ * The saturation rule's gates that need no context window.
+ *
+ * Separate from {@link classifySaturatedFailure} because resolving a window costs
+ * an adapter call: the guard asks these questions first and only reaches for
+ * `ctx.llm.resolveModelInfo` when they all pass, so neither a healthy turn nor a
+ * finish another rule already claimed ever pays for this one.
+ *
+ * Every gate here is a reason *not* to act, which is the direction this rule has
+ * to fail in: it is the only one that turns a general failure into an overflow.
+ *
+ * @param failure - the terminal `error` finish's failure.
+ * @param usage - the last `usage` chunk seen, or `undefined` when none arrived.
+ * @param config - resolved plugin config.
+ * @returns `true` when only the window comparison is left to decide, narrowing
+ *   `usage` to the provider's own count.
+ */
+export function isSaturatedCandidate(
+  failure: LlmFailure,
+  usage: TokenUsage | undefined,
+  config: ResolvedConfig,
+): usage is TokenUsage {
+  if (!config.classifySaturatedFailures) return false
+  if (ATTRIBUTED_CODES.has(failure.code)) return false
+  if (isAttributedStatus(failure.status)) return false
+  // No provider count, no verdict: without it there is nothing to compare
+  // against a window, and guessing would make every failure on an
+  // unknown-shaped usage chunk read as an overflow.
+  if (usage === undefined) return false
+  const promptTokens = promptTokensOf(usage)
+  return Number.isFinite(promptTokens) && promptTokens >= 0
+}
+
+/**
+ * Whether one terminal failure is a saturated prompt the harness could not name.
+ *
+ * The reading is arithmetic and uses only the provider's own numbers: it counted
+ * `inputTokens + cacheReadTokens + cacheWriteTokens` for this request, and that
+ * count has reached `saturationRatio` of the window the adapter resolves for the
+ * same route. A prompt that fills the window, delivered as a failure whose code
+ * names no other cause, is an overflow — and the alternative reading ("the
+ * provider failed for an unrelated reason exactly when the prompt happened to be
+ * full, twice in a row") is the one that leaves the session permanently stuck
+ * (discussion #7632).
+ *
+ * Fail-closed twice over, both on data the plugin does not own: an unresolvable
+ * window, or a usage chunk the adapter never emitted, means no verdict.
+ *
+ * @param failure - the terminal `error` finish's failure.
+ * @param usage - the last `usage` chunk seen, or `undefined` when none arrived.
+ * @param contextWindow - the route's resolved context capacity, or `undefined`
+ *   when the adapter reports none.
+ * @param config - resolved plugin config.
+ * @returns the evidence when the failure should be reclassified, else `null`.
+ */
+export function classifySaturatedFailure(
+  failure: LlmFailure,
+  usage: TokenUsage | undefined,
+  contextWindow: number | undefined,
+  config: ResolvedConfig,
+): SaturationEvidence | null {
+  if (!isSaturatedCandidate(failure, usage, config)) return null
+  // The service already validates an adapter's capacity as a positive integer
+  // (`llm/src/index.ts:773`); this repeats it because a plugin must not trust a
+  // number it did not validate itself.
+  if (contextWindow === undefined || !Number.isInteger(contextWindow) || contextWindow <= 0) return null
+  const promptTokens = promptTokensOf(usage)
+  if (promptTokens < config.saturationRatio * contextWindow) return null
+  return {
+    rule: 'context-saturated',
+    promptTokens,
+    contextWindow,
+    code: failure.code,
+    providerMessage: failure.message,
+    ...failure.status === undefined ? {} : { status: failure.status },
+    ...failure.requestId === undefined ? {} : { requestId: failure.requestId },
+  }
+}
+
+/**
  * Classify one terminal finish against both rules.
  *
  * The cheap discriminant first: a `max-tokens` finish is a truncation question,
  * an `error` finish is a refusal question, and everything else passes through.
+ *
+ * The saturation rule is not here: it needs the route's resolved window, which
+ * only an adapter call can answer, so {@link guardOverflowStream} evaluates it
+ * separately — after this function has declined the finish *and* after the
+ * saturation rule's own gates have passed on the failure alone.
  *
  * @param reason - the stream's terminal finish reason.
  * @param usage - the last `usage` chunk seen, or `undefined` when none arrived.
@@ -522,6 +795,38 @@ export function oversizeFailure(evidence: OversizeEvidence, route: { provider: s
 }
 
 /**
+ * The `CONTEXT_WINDOW_EXCEEDED` failure that replaces a saturated, unattributed
+ * one.
+ *
+ * The provider's own message is carried over verbatim: it is the only record of
+ * what the failing request said, and the code the harness derived from it named
+ * nothing, so a reader's next question is exactly what those words were. The
+ * route's resolved window and the provider's counted prompt go next to it —
+ * those two numbers are what make the rewrite checkable against the session log.
+ *
+ * `providerRetryAfterMs` is dropped for the same reason as on the other two
+ * rewrites: waiting does not make an oversized request smaller, and this code is
+ * not retryable.
+ *
+ * @param evidence - what the saturated failure reported.
+ * @param route - the provider/model the request went to.
+ * @returns the failure the loop routes to `agent/request-error`.
+ */
+export function saturationFailure(evidence: SaturationEvidence, route: { provider: string; model: string }): LlmFailure {
+  const ratio = (evidence.promptTokens / evidence.contextWindow).toFixed(2)
+  return {
+    code: CONTEXT_WINDOW_EXCEEDED_CODE,
+    message: `${route.provider}/${route.model} failed as ${evidence.code} after the provider counted`
+      + ` ${evidence.promptTokens} prompt token(s) against the ${evidence.contextWindow}-token window that route`
+      + ` advertises (${ratio}x): ${evidence.providerMessage}. Reclassified as ${CONTEXT_WINDOW_EXCEEDED_CODE}`
+      + " by length-stop-overflow (discussion #7632): on a prompt this full the provider's own numbers name the"
+      + ' reason, and the code it arrived with is one no recovery reads.',
+    ...evidence.status === undefined ? {} : { status: evidence.status },
+    ...evidence.requestId === undefined ? {} : { requestId: evidence.requestId },
+  }
+}
+
+/**
  * Replace one terminal finish with the overflow failure the recovery path reads.
  *
  * Replay metadata is dropped on both paths: it describes a successful response
@@ -542,7 +847,9 @@ export function rewriteFinish(
   const { replayState: _discarded, ...rest } = chunk
   const failure = detection.rule === 'length-stop'
     ? overflowFailure(detection, route)
-    : oversizeFailure(detection, route)
+    : detection.rule === 'request-too-large'
+      ? oversizeFailure(detection, route)
+      : saturationFailure(detection, route)
   return { ...rest, reason: { kind: 'error', failure } }
 }
 
@@ -563,6 +870,10 @@ export function rewriteFinish(
  *   passes a `ctx.logger.warn` delegate.
  * @param requestBytes - measures the request on demand. Called only when the
  *   size rule detects, so a healthy request is never serialized.
+ * @param resolveWindow - resolves the route's context capacity on demand. Called
+ *   only when every other rule has declined the finish *and* the saturation
+ *   rule's window-independent gates have passed, so a healthy turn never pays an
+ *   adapter lookup for it. Returning `undefined` fails the rule closed.
  * @returns the stream, with an unnameable overflow reported as
  *   `CONTEXT_WINDOW_EXCEEDED`.
  */
@@ -572,6 +883,7 @@ export async function* guardOverflowStream(
   route: { provider: string; model: string },
   onDetect?: (detection: OverflowDetection) => void,
   requestBytes?: () => number | undefined,
+  resolveWindow?: (provider: string, model: string) => Promise<number | undefined>,
 ): AsyncIterable<StreamChunk> {
   if (config.mode === 'off') {
     for await (const chunk of source) yield chunk
@@ -587,7 +899,16 @@ export async function* guardOverflowStream(
       continue
     }
     if (chunk.type === 'finish') {
-      const detection = classifyFinish(chunk.reason, usage, config)
+      let detection = classifyFinish(chunk.reason, usage, config)
+      // The saturation rule is the only one that needs the route's window, and
+      // resolving it costs an adapter call, so it runs last and only for a finish
+      // the cheaper rules have already declined. A `max-tokens` finish never
+      // reaches it: the truncation rule owns that shape.
+      if (detection === null && chunk.reason.kind === 'error'
+        && isSaturatedCandidate(chunk.reason.failure, usage, config) && resolveWindow !== undefined) {
+        const contextWindow = await resolveWindow(route.provider, route.model)
+        detection = classifySaturatedFailure(chunk.reason.failure, usage, contextWindow, config)
+      }
       if (detection !== null) {
         const measured = detection.rule === 'request-too-large' ? requestBytes?.() : undefined
         const evidence: OverflowDetection = detection.rule === 'request-too-large' && measured !== undefined
@@ -623,10 +944,21 @@ export const guardLengthStopStream = guardOverflowStream
  *   behaviour as one that went through schemastery).
  */
 export function apply(ctx: Context, config: Config = {}): void {
+  // Read once, at wiring time. `inject = ['llm']` is what makes this read legal:
+  // cordis refuses a service property read from a fiber that did not declare it
+  // ("cannot get property 'llm' without inject"), and the declaration is carried
+  // by the plugin *object* handed to `ctx.plugin` — the module namespace the
+  // loader imports, which includes this module's `inject` export. A hand-rolled
+  // mount that spreads only `{ name, apply }` drops it, so reading here makes
+  // that mount fail where it can be seen, instead of leaving the saturation rule
+  // silently dead inside every stream (it is the only rule that needs a service).
+  const { llm } = ctx
   const resolved: ResolvedConfig = {
     mode: config.mode ?? DEFAULT_MODE,
     atMostOutputTokens: config.atMostOutputTokens ?? DEFAULT_AT_MOST_OUTPUT_TOKENS,
     classifyOversizeRequests: config.classifyOversizeRequests ?? DEFAULT_CLASSIFY_OVERSIZE_REQUESTS,
+    classifySaturatedFailures: config.classifySaturatedFailures ?? DEFAULT_CLASSIFY_SATURATED_FAILURES,
+    saturationRatio: config.saturationRatio ?? DEFAULT_SATURATION_RATIO,
   }
 
   ctx.on('llm/stream', (options: GenerateOptions, next: () => AsyncIterable<StreamChunk>) => {
@@ -651,6 +983,20 @@ export function apply(ctx: Context, config: Config = {}): void {
           )
           return
         }
+        if (detection.rule === 'context-saturated') {
+          ctx.logger.warn(
+            'length-stop-overflow: %s/%s failed as %s with %d prompt token(s) on a %d-token window (%.2fx): %s; %s (discussion #7632)',
+            options.provider,
+            options.model,
+            detection.code,
+            detection.promptTokens,
+            detection.contextWindow,
+            detection.promptTokens / detection.contextWindow,
+            detection.providerMessage,
+            verdict,
+          )
+          return
+        }
         ctx.logger.warn(
           'length-stop-overflow: %s/%s refused the request as too large (%s: %s)%s; %s (discussion #7626)',
           options.provider,
@@ -662,6 +1008,17 @@ export function apply(ctx: Context, config: Config = {}): void {
         )
       },
       () => estimateRequestBytes(options),
+      async (provider, model) => {
+        try {
+          const info = await llm.resolveModelInfo(provider, model, options.signal)
+          return info.context?.contextWindow
+        } catch {
+          // A route whose capacity cannot be resolved is one this rule cannot
+          // judge. The finish keeps the code the adapter chose, which is what
+          // would have happened without the plugin.
+          return undefined
+        }
+      },
     )
   })
 }
