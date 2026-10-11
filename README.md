@@ -1,6 +1,6 @@
 # @argszero/cordis-plugin-length-stop-overflow
 
-**Three ways a provider refuses an over-long request without naming the reason —
+**Four ways a provider refuses an over-long request without naming the reason —
 all read as something the harness does not recover from, all restored to the
 overflow recovery that already exists.**
 
@@ -137,23 +137,120 @@ Two design notes make this rule safe to leave on by default:
 `classifySaturatedFailures: false` turns this trigger off without touching the
 other two.
 
+## The fourth defect (discussion #9434)
+
+A provider can enforce a tighter budget than the window it declares, refuse the
+request for exceeding it, and say so in a body that names no cause. The reported
+route (`opencode-go` / `deepseek-v4.1-flash`) declares
+`contextWindow: 1000000` and a 384,000-token output capability, and refuses
+anything whose `prompt_tokens + max_tokens` exceeds `2^20`. Its refusals arrive
+as **HTTP 400** with a 31-byte body (`{"model":"deepseek-v4.1-flash"}`, no
+`error` field), so the SDK surfaces `400 status code (no body)`; the reporter's
+session crossed the real wall at ~664,576 prompt tokens — about 63% of the
+advertised window — and every later request failed, until a manual `/compact`
+shrank it.
+
+Nothing in the harness can read that refusal: the built-in recovery is gated on
+the code alone (`compaction-basic/src/index.ts:194` —
+`failure.code !== CONTEXT_WINDOW_EXCEEDED_CODE || signal.aborted`), there is no
+wording in 31 bytes for the second rule to match, and no `usage` count arrives
+for the third to compare — the prompt comes back `INVALID_REQUEST` with
+`usage: 0`.
+
+What is left is arithmetic the harness can do on its own side: how big is the
+request it just sent? The plugin asks its **own meter** for that number and
+compares it against the window the route advertises:
+
+```
+error finish, nothing attributed, harness meter >= fullRequestRatio x window
+    ->  { kind: 'error', failure: { code: 'CONTEXT_WINDOW_EXCEEDED', … } }
+```
+
+The synthesized failure carries both numbers, the line, and the words the
+provider did send:
+
+```
+openrouter/deepseek/deepseek-v4.1-flash refused the request as INVALID_REQUEST
+while this session's own meter priced it at 673267 token(s) against the
+1000000-token window that route advertises (0.67x, at or above the 500000-token
+line this rule acts on): 400 status code (no body). Reclassified as
+CONTEXT_WINDOW_EXCEEDED by length-stop-overflow (discussion #9434): …
+```
+
+### The line is a substitute — the earlier arithmetic is not observable here
+
+Earlier in this thread we stated the predicate as
+`prompt_tokens + cap actually reserved on the wire > declared contextWindow`.
+That is the provider's rule, and it is what the report measures — but **it
+cannot be evaluated at this seam**, and this rule does not pretend to evaluate
+it. The cap a request carries is decided below the plugin:
+
+- `llm-pi-ai` forwards one only when the call names it (`adapter.ts:405`), and a
+  loop-built call names one only when the session's effective envelope does
+  (`llm/src/call-config.ts:23`); otherwise pi-ai sizes the request from the
+  catalog's own `maxTokens`;
+- `LlmResolvedModelInfo` (`llm/src/types.ts:410`) reports
+  `context.contextWindow` and an adapter's `defaultMaxTokens`, and **no** catalog
+  output capability — `maxTokens` appears in the type only on a *discovered*
+  model (`types.ts:316`), which is a settings-time draft rather than the request
+  path;
+- and the number actually sent is produced after that, inside pi-ai's
+  `clampMaxTokensToContext` on the clamped request path, from a local estimate
+  that can sit tens of thousands of tokens below the provider's own count. It is
+  not reported back to the harness at all.
+
+So "the cap reserved on the wire" is not a number a plugin can read — nor one
+the harness reads, which is precisely why the compaction threshold and the wire
+cap are free to disagree. That disagreement is the *other* half of the report,
+and it is a core question, not this plugin's: what this rule changes is only
+what the **failure means**, so the tree can recover from it.
+
+The two numbers it does own are the harness' own meter —
+`tokenMeter.measure(session).totalTokens`, the same measurement
+`compaction-basic/src/index.ts:278` compares against its own threshold — and the
+resolved window. The line is therefore a **policy, not an identity**:
+`fullRequestRatio` (default 0.5) of the declared window, deliberately **below**
+the compaction policy's own threshold (default `thresholdRatio: 0.8`), because
+the whole defect is that the provider's real input capacity can be smaller than
+the window the harness believes in.
+
+Three further notes:
+
+- **It is the only rule that can act on a refusal carrying no count of any
+  kind** — trigger 3 reads the provider's arithmetic, trigger 4 the harness'. On
+  a real circuit the provider's count is the stronger evidence, so trigger 3 is
+  evaluated first and trigger 4 only sees what it declined; the two share one
+  window lookup.
+- **It is fail-closed three times over**: no `sessions`/`tokenMeter` service, no
+  session for the id the request carried, or a measurement that is not a finite
+  non-negative number — and nothing happens. The rule is reached through
+  cordis' untracked `ctx.get`, so a profile without a meter still gets triggers
+  1–3, and a service whose shape drifts declines exactly as an absent one does.
+- **It costs nothing on a healthy turn.** The gate is a failure whose code
+  attributes nothing; a `max-tokens` finish and an attributed error never ask
+  for a measurement or a window.
+
+`classifyFullRequestRefusals: false` turns this trigger off without touching the
+other three.
+
 ## What the plugin does
 
 Observes the public `llm/stream` waterfall and rewrites the terminal frame of
-either defect into the `CONTEXT_WINDOW_EXCEEDED` failure the harness already
-knows how to recover from:
+any of the four defects into the `CONTEXT_WINDOW_EXCEEDED` failure the harness
+already knows how to recover from:
 
 ```
-max-tokens finish              ->  { kind: 'error', failure: { code: 'CONTEXT_WINDOW_EXCEEDED', … } }
-error finish (size refusal)    ->  { kind: 'error', failure: { code: 'CONTEXT_WINDOW_EXCEEDED', … } }
-error finish (saturated prompt) -> { kind: 'error', failure: { code: 'CONTEXT_WINDOW_EXCEEDED', … } }
+max-tokens finish               ->  { kind: 'error', failure: { code: 'CONTEXT_WINDOW_EXCEEDED', … } }
+error finish (size refusal)     ->  { kind: 'error', failure: { code: 'CONTEXT_WINDOW_EXCEEDED', … } }
+error finish (saturated prompt) ->  { kind: 'error', failure: { code: 'CONTEXT_WINDOW_EXCEEDED', … } }
+error finish (full request)     ->  { kind: 'error', failure: { code: 'CONTEXT_WINDOW_EXCEEDED', … } }
 ```
 
 `@deepseek-ai/dsh-compaction-basic` (mounted in `bundle/base` and
 `bundle/web-app`) then compacts and returns `{ kind: 'retry' }`, bounded by its
 own `maxOverflowRetries` (default 1) — so there is no retry loop.
 
-Two properties make the rewrite exact rather than approximate:
+Three properties make the rewrite exact rather than approximate:
 
 - The synthesized failure carries the harness' **own**
   `CONTEXT_WINDOW_EXCEEDED_CODE`, imported by value from `@deepseek-ai/dsh-llm`,
@@ -187,8 +284,8 @@ Two honesty notes:
 
 ## The verdict is window-independent
 
-The plugin fires only when a `max-tokens` finish arrives with a negligible
-output count. A real output cap cannot look like this: the budget it hits is the
+The **truncation** rule fires only when a `max-tokens` finish arrives with a
+negligible output count. A real output cap cannot look like this: the budget it hits is the
 model's own — tens of thousands of tokens in the catalog — so a `length` stop
 after one or two tokens is a truncation of *our request*, whoever truncated it.
 That is why the rule needs no context-window number, which is what makes it work
@@ -218,11 +315,19 @@ size rule is narrow on purpose. It never reclassifies:
   below `saturationRatio` of the window, a route whose capacity cannot be
   resolved, or a capacity that is not a positive integer — all leave the
   failure exactly as it arrived;
+- an **unattributed failure on a request the harness' own meter prices below
+  the line**: no `sessions`/`tokenMeter` service, no session for the id the
+  request carried, a request that carried no session id at all, a route whose
+  capacity cannot be resolved, a measurement that is not a finite non-negative
+  number, or a price below `fullRequestRatio` of that window — the same
+  fail-closed answer, for the same reason: the plugin may not become a new way
+  for a turn to fail;
 - a rate limit, a transport failure, or a malformed request that merely mentions
   a size noun.
 
 `classifyOversizeRequests: false` turns the second trigger off without touching
-the first; `classifySaturatedFailures: false` does the same for the third.
+the others; `classifySaturatedFailures: false` does the same for the third, and
+`classifyFullRequestRefusals: false` for the fourth.
 
 ## What this does not fix
 
@@ -266,6 +371,8 @@ overlay):
         classifyOversizeRequests: true   # default: true
         classifySaturatedFailures: true  # default: true
         saturationRatio: 0.99            # default: 0.99
+        classifyFullRequestRefusals: true # default: true
+        fullRequestRatio: 0.5            # default: 0.5
 ```
 
 | option | meaning |
@@ -277,6 +384,18 @@ overlay):
 | `classifyOversizeRequests` | also reclassify a request refused for its size — `413`, or size wording on a request-rejection code (default `true`) |
 | `classifySaturatedFailures` | also reclassify an unattributed failure whose prompt count has reached the route's window (default `true`) |
 | `saturationRatio` | fraction of the resolved window at which that prompt count counts as saturated (default `0.99`) |
+| `classifyFullRequestRefusals` | also reclassify an unattributed failure on a request the harness' own meter prices at `fullRequestRatio` of the window (default `true`) |
+| `fullRequestRatio` | fraction of the declared window at which that measurement counts as a full request (default `0.5`) |
+
+`fullRequestRatio` is the one knob set by policy rather than by measurement —
+the window it is a fraction of is declared by the route, and the capacity the
+provider actually enforces is not observable from here (see *The line is a
+substitute* above). Lower it to catch a provider that refuses earlier than its
+declared window; raise it if your routes are honest and you would rather the
+alert came from trigger 3's provider-side count. A route that refuses earlier
+than half its declared window is one whose declared window is wrong, and this
+rule is not the right place to assert that: it decides what a refusal *means*,
+never what a window *is*.
 
 Raise `saturationRatio`'s bar (e.g. `1.0`) if your route advertises a window far
 larger than it enforces; lower it if your provider refuses slightly *before* the
@@ -301,11 +420,12 @@ together:
 | `length-stop-overflow` (#7214) | **no error at all** — a `length` stop after one token | `max-tokens` |
 | `length-stop-overflow` ≥0.2.0 (#7626) | an **error** refusing the request for its size (413, no body) | `INVALID_REQUEST` |
 | `length-stop-overflow` ≥0.3.0 (#7632) | an **error** naming nothing, on a prompt the provider counted at the window | `PI_AI_ERROR` |
+| `length-stop-overflow` ≥0.4.0 (#9434) | an **error** naming nothing, on a request the harness' own meter priced at half the declared window | `INVALID_REQUEST`, `400 status code (no body)` |
 
 ## Tests
 
 ```sh
-npm test        # tsc, then 109 tests over a real Cordis context
+npm test        # tsc, then 134 tests over a real Cordis context
 ```
 
 Three layers, each with a control arm, so a green run is evidence rather than an
@@ -323,10 +443,16 @@ accident:
   exact `INVALID_REQUEST` — which compacts nothing without the plugin; hop 4: the
   saturation rule through a real mounted context — the reported turn and its
   unmounted control, plus the arms where the route resolves no window, where the
-  capacity lookup is refused, and where the prompt has room. Hop 4 stops at the
-  waterfall on purpose: the failure it emits is the same
-  `CONTEXT_WINDOW_EXCEEDED_CODE` by value that hop 2 already proved passes the
-  recovery's gate, so a second compaction arm would re-measure hop 2's subject.)
+  capacity lookup is refused, and where the prompt has room; hop 5: the
+  full-request rule through the real waterfall — the reported turn, and the arms
+  that keep it honest: an attributed code at the reported price, a `max-tokens`
+  finish at that price, a healthy turn that must not pay for either a
+  measurement or a window lookup, the saturation rule taking precedence when the
+  provider's own count qualifies, and the two rules sharing one window lookup.
+  Hops 4 and 5 stop at the waterfall on purpose: the failure they emit is the
+  same `CONTEXT_WINDOW_EXCEEDED_CODE` by value that hop 2 already proved passes
+  the recovery's gate, so a further compaction arm would re-measure hop 2's
+  subject.)
 
 Plus a packaging guard asserting that the shipped artifact's bare imports and
 its runtime dependency declarations match in **both** directions.

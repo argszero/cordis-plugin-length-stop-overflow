@@ -1,5 +1,5 @@
 # The @argszero/cordis-plugin-length-stop-overflow bundle patch.
-# Mounting needs no configuration: mode='error' by default. All three triggers
+# Mounting needs no configuration: mode='error' by default. All four triggers
 # below are on by default; 'warn' reports without changing behaviour, 'off'
 # disables.
 #
@@ -12,6 +12,9 @@
 #           classifyOversizeRequests: true   # 413 / size-wording refusals
 #           classifySaturatedFailures: true  # window-full prompts, unnamed
 #           saturationRatio: 0.99            # how full counts as full
+#           classifyFullRequestRefusals: true # full requests, unnamed
+#           fullRequestRatio: 0.5            # how full counts as full, measured
+#                                            # by the harness' own meter
 #
 # What it guards (discussion #7214). A provider can answer "your request was too
 # large" without failing: it truncates and says `finish_reason: "length"`, which
@@ -115,6 +118,43 @@
 # throws leaves the stream untouched — the guard may not become a new way for a
 # turn to fail, and the alternatives (assume a window, trust a usage chunk that
 # never arrived) would claim failures this plugin cannot substantiate.
+#
+# What it guards, the fourth (discussion #9434). A provider can enforce a tighter
+# budget than the window it declares, refuse the request for exceeding it, and
+# say so in a body that names nothing: HTTP 400 with a 31-byte payload carrying
+# no `error` field, which the SDK surfaces as "400 status code (no body)" and the
+# adapter classifies as INVALID_REQUEST. The recovery gate above reads the code
+# alone, so nothing compacts; the session repeats the same oversized request on
+# every turn until a manual /compact shrinks it.
+#
+# The reported route declares contextWindow 1000000 and a 384000 output
+# capability while refusing anything whose prompt_tokens + max_tokens exceeds
+# 2^20 — approximately 63% of the advertised window. Triggers 1-3 cannot read
+# that refusal: there is no length stop, no wording to match, and the failure
+# carries usage 0, so the count trigger 3 compares is zero.
+#
+# What is left is the harness' own arithmetic. The plugin prices the request it
+# just sent with the harness' own meter — the same
+# `meter.measure(session).totalTokens` that compaction-basic compares against its
+# own threshold (compaction-basic/src/index.ts:278) — and compares it against the
+# window the route advertises. At or above fullRequestRatio (default 0.5), on a
+# failure nothing else attributed, the refusal is called what it is.
+#
+# The line is a policy, not an identity: the output budget actually carried on
+# the wire is chosen below this seam (llm-pi-ai forwards options.maxTokens only
+# when the call names one; otherwise pi-ai sizes the request from the catalog's
+# own maxTokens and then clamps it with clampMaxTokensToContext), and
+# LlmResolvedModelInfo reports neither the catalog capability nor the clamped
+# value. So the plugin compares two numbers it does own — the harness' meter and
+# the declared window — and states the ratio it acts on in the failure text. It
+# is deliberately below the compaction threshold, because the whole defect is
+# that the provider's real input capacity can be smaller than the window the
+# harness believes in.
+#
+# Fail-closed three times over: no sessions/tokenMeter service, no session for
+# the id the request carried, or a measurement that is not a finite non-negative
+# number, and the failure keeps the code the adapter chose. Reached through
+# cordis' untracked ctx.get, so a profile without a meter still gets triggers 1-3.
 #
 # Start with mode='warn' to measure how often your own traffic hits any trigger
 # before letting it change behaviour.

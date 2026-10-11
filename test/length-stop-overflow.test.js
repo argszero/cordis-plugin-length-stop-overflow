@@ -19,24 +19,30 @@ import InvariantRegistry from '@deepseek-ai/dsh-invariants'
 import {
   apply,
   classifyFinish,
+  classifyFullRequestRefusal,
   classifyLengthStop,
   classifyOversizeFailure,
   classifySaturatedFailure,
   Config,
   DEFAULT_AT_MOST_OUTPUT_TOKENS,
+  DEFAULT_CLASSIFY_FULL_REQUEST_REFUSALS,
   DEFAULT_CLASSIFY_OVERSIZE_REQUESTS,
   DEFAULT_CLASSIFY_SATURATED_FAILURES,
+  DEFAULT_FULL_REQUEST_RATIO,
   DEFAULT_MODE,
   DEFAULT_SATURATION_RATIO,
   estimateRequestBytes,
   formatBytes,
+  fullRequestFailure,
   guardLengthStopStream,
   guardOverflowStream,
   inject,
   isAttributedStatus,
+  isFullRequestCandidate,
   isMaxTokensFinish,
   isRequestTooLargeFailure,
   isSaturatedCandidate,
+  measureRequestTokens,
   name,
   overflowFailure,
   oversizeFailure,
@@ -53,6 +59,8 @@ function cfg(over = {}) {
     classifyOversizeRequests: DEFAULT_CLASSIFY_OVERSIZE_REQUESTS,
     classifySaturatedFailures: DEFAULT_CLASSIFY_SATURATED_FAILURES,
     saturationRatio: DEFAULT_SATURATION_RATIO,
+    classifyFullRequestRefusals: DEFAULT_CLASSIFY_FULL_REQUEST_REFUSALS,
+    fullRequestRatio: DEFAULT_FULL_REQUEST_RATIO,
     ...over,
   }
 }
@@ -1188,4 +1196,365 @@ test('a mount that drops the module\u2019s inject declaration fails loudly', asy
   const ctx = new Context()
   await ctx.plugin(LlmRuntime)
   await assert.rejects(async () => { await ctx.plugin({ name, apply }, {}) }, /without inject/)
+})
+
+/* ------------------------------------------------------------------ *
+ * Trigger 4 — a full request refused with nothing to read (#9434)
+ * ------------------------------------------------------------------ */
+
+/**
+ * The reported route: `opencode-go` / `deepseek-v4.1-flash` with a declared
+ * window of 1,000,000, a catalog output capability of 384,000, and a provider
+ * that refuses anything whose `prompt_tokens + max_tokens` exceeds `2^20`.
+ */
+const FULL_WINDOW = 1_000_000
+
+/** The failing request's price, as the reporter measured it (~673,267 tokens). */
+const REPORTED_PROMPT_TOKENS = 673_267
+
+/**
+ * The failure the reporter's session answered every turn with, verbatim in
+ * shape: HTTP 400, a 31-byte body carrying no `error` field, `usage: 0`, and the
+ * `INVALID_REQUEST` the adapter derives from a request rejection.
+ */
+const REPORTED_400 = {
+  type: 'finish',
+  reason: {
+    kind: 'error',
+    failure: { code: 'INVALID_REQUEST', message: '400 status code (no body)' },
+  },
+}
+
+/** The `usage` chunk the reported failures carried: the provider counted nothing. */
+const ZERO_USAGE = { type: 'usage', usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } }
+
+/** A measurement delegate that answers with a fixed price and counts its calls. */
+function measurement(value = REPORTED_PROMPT_TOKENS) {
+  const calls = []
+  const measure = () => {
+    calls.push(value)
+    return value
+  }
+  measure.calls = calls
+  return measure
+}
+
+/** Drain one stream through the guard with a measurement delegate. */
+async function drainFull(chunks, config = cfg(), resolveWindow = windowResolver(FULL_WINDOW), measureRequest = measurement()) {
+  return drain(guardOverflowStream(from(chunks), config, ROUTE, undefined, undefined, resolveWindow, measureRequest))
+}
+
+test('the reported unattributed 400 on a full request becomes CONTEXT_WINDOW_EXCEEDED', async () => {
+  const out = await drainFull([ZERO_USAGE, REPORTED_400])
+  const finish = out.at(-1)
+  assert.equal(finish.reason.kind, 'error')
+  assert.equal(finish.reason.failure.code, CONTEXT_WINDOW_EXCEEDED_CODE)
+})
+
+test('the full-request failure names the harness\u2019 own numbers, the line and the provider\u2019s words', async () => {
+  const { failure } = (await drainFull([ZERO_USAGE, REPORTED_400])).at(-1).reason
+  assert.match(failure.message, /openrouter\/deepseek\/deepseek-v4\.1-flash/)
+  assert.match(failure.message, /673267 token/)
+  assert.match(failure.message, /1000000-token window/)
+  assert.match(failure.message, /0\.67x/)
+  // The line has to be in the text: this verdict is a policy, and a reader must
+  // be able to see how far above the line the request sat.
+  assert.match(failure.message, /500000-token line/)
+  assert.match(failure.message, /400 status code \(no body\)/)
+  assert.match(failure.message, /INVALID_REQUEST/)
+  assert.match(failure.message, /length-stop-overflow/)
+  assert.match(failure.message, /9434/)
+})
+
+test('every non-terminal chunk is forwarded identically and in order', async () => {
+  const chunks = [ZERO_USAGE, REPORTED_400]
+  const out = await drainFull(chunks)
+  assert.deepEqual(out.slice(0, -1), chunks.slice(0, -1))
+})
+
+test('a rewritten full-request failure still carries exactly one terminal frame', async () => {
+  const out = await drainFull([ZERO_USAGE, REPORTED_400])
+  assert.equal(out.filter((chunk) => chunk.type === 'finish').length, 1)
+  assert.equal(out.at(-1).type, 'finish')
+})
+
+test('the caller\u2019s status and request id survive the rewrite', async () => {
+  const failure = {
+    code: 'INVALID_REQUEST',
+    message: '400 status code (no body)',
+    status: 400,
+    requestId: 'req_9434',
+  }
+  const { failure: rewritten } = (await drainFull([ZERO_USAGE, errorFinish(failure)])).at(-1).reason
+  assert.equal(rewritten.status, 400)
+  assert.equal(rewritten.requestId, 'req_9434')
+  // Waiting does not make an oversized request smaller, and this code is not
+  // retryable — the same reason the other two rewrites drop it.
+  assert.equal(rewritten.providerRetryAfterMs, undefined)
+})
+
+test('rewriteFinish routes a full-request detection to its own failure text', () => {
+  const detection = classifyFullRequestRefusal(
+    { code: 'INVALID_REQUEST', message: '400 status code (no body)' },
+    REPORTED_PROMPT_TOKENS,
+    FULL_WINDOW,
+    cfg(),
+  )
+  assert.equal(detection.rule, 'full-request-refused')
+  const rewritten = rewriteFinish({ type: 'finish', reason: { kind: 'error', failure: { code: 'X', message: 'y' } } }, detection, ROUTE)
+  assert.equal(rewritten.reason.failure.message, fullRequestFailure(detection, ROUTE).message)
+})
+
+/* ---- the gates ---- */
+
+test('the full-request gates accept an unattributed request rejection', () => {
+  assert.equal(isFullRequestCandidate({ code: 'INVALID_REQUEST', message: '400 status code (no body)' }, cfg()), true)
+  assert.equal(isFullRequestCandidate({ code: 'PI_AI_ERROR', message: 'boom' }, cfg()), true)
+})
+
+test('the full-request gates refuse a failure another cause already owns', () => {
+  for (const code of ['QUOTA', 'EMPTY_RESPONSE', 'AUTH', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT', 'STREAM_CLOSED', 'INVARIANT', 'INVALID_ARGS', 'NO_ADAPTER', 'CONTEXT_WINDOW_EXCEEDED', 'IMAGE_OFFLOAD_REQUIRED']) {
+    assert.equal(isFullRequestCandidate({ code, message: 'x' }, cfg()), false, `${code} must be left alone`)
+  }
+})
+
+test('the full-request gates refuse a status that attributes the failure', () => {
+  for (const status of [500, 503, 401, 403, 408, 429]) {
+    assert.equal(isFullRequestCandidate({ code: 'INVALID_REQUEST', message: 'x', status }, cfg()), false)
+  }
+  // A 400 is the shape this rule exists for: the provider refused the request
+  // itself, and nothing in the status says why.
+  assert.equal(isFullRequestCandidate({ code: 'INVALID_REQUEST', message: 'x', status: 400 }, cfg()), true)
+})
+
+test('the full-request rule can be switched off entirely', () => {
+  assert.equal(isFullRequestCandidate({ code: 'INVALID_REQUEST', message: 'x' }, cfg({ classifyFullRequestRefusals: false })), false)
+  assert.equal(
+    classifyFullRequestRefusal({ code: 'INVALID_REQUEST', message: 'x' }, REPORTED_PROMPT_TOKENS, FULL_WINDOW, cfg({ classifyFullRequestRefusals: false })),
+    null,
+  )
+})
+
+/* ---- the line ---- */
+
+test('the reported price is above the line and a small request is below it', () => {
+  const failure = { code: 'INVALID_REQUEST', message: '400 status code (no body)' }
+  assert.notEqual(classifyFullRequestRefusal(failure, REPORTED_PROMPT_TOKENS, FULL_WINDOW, cfg()), null)
+  assert.equal(classifyFullRequestRefusal(failure, 499_999, FULL_WINDOW, cfg()), null)
+})
+
+test('the line is inclusive and is floor(fullRequestRatio x window)', () => {
+  const failure = { code: 'INVALID_REQUEST', message: 'x' }
+  const atLine = classifyFullRequestRefusal(failure, 500_000, FULL_WINDOW, cfg())
+  assert.equal(atLine.threshold, 500_000)
+  assert.equal(atLine.measuredTokens, 500_000)
+  assert.equal(classifyFullRequestRefusal(failure, 499_999, FULL_WINDOW, cfg()), null)
+  // A non-integral line floors, so the threshold never claims more room than the
+  // ratio granted: 0.4999 of a 1,000-token window is a 499-token line, and a
+  // 499-token request is therefore *at* it while a 498-token one is not.
+  assert.equal(classifyFullRequestRefusal(failure, 498, 1_000, cfg({ fullRequestRatio: 0.4999 })), null)
+  assert.equal(classifyFullRequestRefusal(failure, 499, 1_000, cfg({ fullRequestRatio: 0.4999 }))?.threshold, 499)
+})
+
+test('raising fullRequestRatio narrows the rule without touching the others', async () => {
+  const chunks = [ZERO_USAGE, REPORTED_400]
+  const raised = cfg({ fullRequestRatio: 0.9 })
+  // 673,267 of 1,000,000 is below a 0.9 line — the operator asked for a rule
+  // that only acts on a request that has essentially filled the window.
+  assert.deepEqual(await drainFull(chunks, raised), chunks)
+  // And the same turn still classifies at the default line, so the knob moved
+  // this rule and nothing else.
+  assert.equal((await drainFull(chunks, cfg())).at(-1).reason.failure.code, CONTEXT_WINDOW_EXCEEDED_CODE)
+})
+
+/* ---- fail-closed arms ---- */
+
+test('the full-request rule fails closed without a measurement', () => {
+  const failure = { code: 'INVALID_REQUEST', message: 'x' }
+  assert.equal(classifyFullRequestRefusal(failure, undefined, FULL_WINDOW, cfg()), null)
+  for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, -1]) {
+    assert.equal(classifyFullRequestRefusal(failure, bad, FULL_WINDOW, cfg()), null, `${String(bad)} must not classify`)
+  }
+})
+
+test('the full-request rule fails closed without a usable window', () => {
+  const failure = { code: 'INVALID_REQUEST', message: 'x' }
+  for (const bad of [undefined, 0, -1, 1.5]) {
+    assert.equal(classifyFullRequestRefusal(failure, REPORTED_PROMPT_TOKENS, bad, cfg()), null, `${String(bad)} must not classify`)
+  }
+})
+
+test('an unattributed refusal is left alone when no measurement can be read', async () => {
+  const chunks = [ZERO_USAGE, REPORTED_400]
+  const noMeasure = await drain(guardOverflowStream(from(chunks), cfg(), ROUTE, undefined, undefined, windowResolver(FULL_WINDOW)))
+  assert.deepEqual(noMeasure, chunks)
+})
+
+test('an unattributed refusal is left alone when the route resolves no window', async () => {
+  const chunks = [ZERO_USAGE, REPORTED_400]
+  // Written out rather than reused: `windowResolver(value = WINDOW)` defaults an
+  // explicit `undefined` back to the reported window, which is exactly the answer
+  // this arm has to withhold.
+  const resolve = async () => undefined
+  const noWindow = await drain(guardOverflowStream(from(chunks), cfg(), ROUTE, undefined, undefined, resolve, measurement()))
+  assert.deepEqual(noWindow, chunks)
+})
+
+test('an attributed failure is left alone even at the reported price', async () => {
+  // The adversarial shape for this rule: the request is full by our own meter,
+  // and the code says the provider timed out. The code wins, because a
+  // compaction would not fix a timeout — and it wins *before* the measurement,
+  // which is the other half of that claim: the window-free gate is what keeps a
+  // failure another recovery owns from costing a pass over the session surface
+  // at all.
+  const measure = measurement()
+  const resolve = windowResolver(FULL_WINDOW)
+  const chunks = [ZERO_USAGE, errorFinish({ code: 'TIMEOUT', message: 'stream idle timeout' })]
+  const out = await drain(guardOverflowStream(from(chunks), cfg(), ROUTE, undefined, undefined, resolve, measure))
+  assert.deepEqual(out, chunks)
+  assert.deepEqual(measure.calls, [])
+  assert.deepEqual(resolve.calls, [])
+})
+
+test('a healthy finish costs neither a measurement nor a window lookup', async () => {
+  const measure = measurement()
+  const resolve = windowResolver(FULL_WINDOW)
+  const done = [{ type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } }, { type: 'finish', reason: { kind: 'stop' } }]
+  const out = await drain(guardOverflowStream(from(done), cfg(), ROUTE, undefined, undefined, resolve, measure))
+  assert.deepEqual(out, done)
+  assert.deepEqual(measure.calls, [])
+  assert.deepEqual(resolve.calls, [])
+})
+
+test('a max-tokens finish never reaches the full-request rule', async () => {
+  // The truncation rule owns that shape, and this one must not widen it behind
+  // an operator's back: a big prompt with a real output cap is not an overflow.
+  const measure = measurement()
+  const resolve = windowResolver(FULL_WINDOW)
+  const chunks = [{ type: 'usage', usage: { inputTokens: 673_267, outputTokens: 9_000 } }, { type: 'finish', reason: { kind: 'max-tokens' } }]
+  const out = await drain(guardOverflowStream(from(chunks), cfg(), ROUTE, undefined, undefined, resolve, measure))
+  assert.deepEqual(out, chunks)
+  assert.deepEqual(measure.calls, [])
+  assert.deepEqual(resolve.calls, [])
+})
+
+/* ---- ordering and sharing with the saturation rule ---- */
+
+test('the saturation rule acts first when the provider\u2019s own count qualifies', async () => {
+  // Both rules would claim this finish: the provider counted 990,000 of a
+  // 1,000,000-token window, and our own meter says the same. The provider's
+  // count is the stronger evidence, so its evidence is what is reported — and
+  // the measurement is never taken.
+  const measure = measurement(990_000)
+  const resolve = windowResolver(FULL_WINDOW)
+  const chunks = [
+    { type: 'usage', usage: { inputTokens: 990_000, outputTokens: 0 } },
+    errorFinish({ code: 'PI_AI_ERROR', message: 'boom' }),
+  ]
+  const seen = []
+  const out = await drain(guardOverflowStream(from(chunks), cfg(), ROUTE, (detection) => seen.push(detection.rule), undefined, resolve, measure))
+  assert.equal(out.at(-1).reason.failure.code, CONTEXT_WINDOW_EXCEEDED_CODE)
+  assert.deepEqual(seen, ['context-saturated'])
+  assert.deepEqual(measure.calls, [])
+  assert.deepEqual(resolve.calls, [`${ROUTE.provider}/${ROUTE.model}`])
+})
+
+test('the measurement fails closed on every reading it does not own', () => {
+  // The rule's evidence comes from two services this plugin does not own, so the
+  // seam is exercised directly: an absent service, a store that does not hold the
+  // id, a meter that throws, and a meter that does not answer with a number all
+  // have to produce the same `undefined`, because `undefined` is what makes the
+  // rule decline instead of guessing a price.
+  const session = { id: 'session-1' }
+  const ctxWith = (services) => ({ get: (name) => services[name] })
+  const meter = (value) => ({ measure: () => ({ totalTokens: value }) })
+  const held = { sessions: { get: () => session } }
+
+  assert.equal(measureRequestTokens(ctxWith({}), 'session-1'), undefined, 'no services mounted')
+  assert.equal(measureRequestTokens(ctxWith({ sessions: { get: () => undefined }, tokenMeter: meter(10) }), 'session-1'), undefined, 'store does not hold the id')
+  assert.equal(measureRequestTokens(ctxWith({ sessions: held.sessions }), 'session-1'), undefined, 'no meter mounted')
+  assert.equal(
+    measureRequestTokens(ctxWith({ ...held, tokenMeter: { measure: () => { throw new Error('not priceable') } } }), 'session-1'),
+    undefined,
+    'a meter that throws is one this rule cannot judge',
+  )
+  for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -1, undefined]) {
+    assert.equal(measureRequestTokens(ctxWith({ ...held, tokenMeter: meter(bad) }), 'session-1'), undefined, `${String(bad)} must not be a price`)
+  }
+  assert.equal(measureRequestTokens(ctxWith({ ...held, tokenMeter: meter(0) }), 'session-1'), 0, 'zero is a price')
+  assert.equal(measureRequestTokens(ctxWith({ ...held, tokenMeter: meter(4508) }), 'session-1'), 4508)
+  assert.equal(measureRequestTokens(ctxWith({ ...held, tokenMeter: meter(4508) }), undefined), undefined, 'a request that carried no session id')
+})
+
+test('an already-classified finish is never relabelled by a rule that runs later', async () => {
+  // The size rule owns this turn, and the provider's own count is saturated on
+  // top of it. Both would classify, and exactly one may: the first match wins,
+  // which is what keeps a specific verdict from being overwritten by a general
+  // one downstream of it.
+  const chunks = [
+    { type: 'usage', usage: { inputTokens: 990_000, outputTokens: 0 } },
+    errorFinish({ code: 'INVALID_REQUEST', message: 'request entity too large', status: 413 }),
+  ]
+  const seen = []
+  const out = await drain(guardOverflowStream(from(chunks), cfg(), ROUTE, (detection) => seen.push(detection), undefined, windowResolver(FULL_WINDOW), measurement()))
+  assert.equal(out.at(-1).reason.failure.code, CONTEXT_WINDOW_EXCEEDED_CODE)
+  assert.deepEqual(seen.map((detection) => detection.rule), ['request-too-large'])
+})
+
+test('one window resolution serves both rules', async () => {
+  // The saturation rule's gates pass (a count arrived) but its ratio does not,
+  // so the full-request rule takes over. Both ask the same question about the
+  // same route, and the answer is paid for once.
+  const resolve = windowResolver(FULL_WINDOW)
+  const measure = measurement()
+  const chunks = [
+    { type: 'usage', usage: { inputTokens: 1_000, outputTokens: 0 } },
+    errorFinish({ code: 'PI_AI_ERROR', message: 'boom' }),
+  ]
+  const out = await drain(guardOverflowStream(from(chunks), cfg(), ROUTE, undefined, undefined, resolve, measure))
+  assert.equal(out.at(-1).reason.failure.code, CONTEXT_WINDOW_EXCEEDED_CODE)
+  assert.deepEqual(resolve.calls, [`${ROUTE.provider}/${ROUTE.model}`])
+  assert.equal(measure.calls.length, 1)
+})
+
+test('the full-request rule carries the reported turn through the real waterfall', async () => {
+  // The real `llm/stream` waterfall, with the measurement and the window
+  // supplied by the same two delegates the plugin wires. What this arm adds to
+  // the generator tests is that nothing between the guard and the caller (the
+  // runtime's own finish assembly, the invariant checks) rejects the shape.
+  const ctx = new Context()
+  await ctx.plugin(LlmRuntime)
+  await ctx.plugin({ name, apply, inject }, {})
+  ctx.llm.registerAdapter(['openrouter'], new WindowedAdapter([ZERO_USAGE, REPORTED_400], FULL_WINDOW))
+  const chunks = []
+  for await (const chunk of ctx.llm.stream({
+    provider: 'openrouter',
+    model: ROUTE.model,
+    messages: [],
+    // No session was mounted in this context, so the real `measureRequestTokens`
+    // finds no store and fails closed — the control arm below.
+    sessionId: 'session-absent',
+  })) chunks.push(chunk)
+  assert.equal(chunks.at(-1).reason.failure.code, 'INVALID_REQUEST')
+})
+
+test('warn mode reports the full-request evidence without changing the stream', async () => {
+  const chunks = [ZERO_USAGE, REPORTED_400]
+  const seen = []
+  const out = await drain(guardOverflowStream(from(chunks), WARN, ROUTE, (detection) => seen.push(detection), undefined, windowResolver(FULL_WINDOW), measurement()))
+  assert.deepEqual(out, chunks)
+  assert.equal(seen.length, 1)
+  assert.equal(seen[0].rule, 'full-request-refused')
+  assert.equal(seen[0].measuredTokens, REPORTED_PROMPT_TOKENS)
+  assert.equal(seen[0].contextWindow, FULL_WINDOW)
+  assert.equal(seen[0].threshold, 500_000)
+  assert.equal(seen[0].code, 'INVALID_REQUEST')
+})
+
+test('off mode never asks for a measurement', async () => {
+  const measure = measurement()
+  const chunks = [ZERO_USAGE, REPORTED_400]
+  const out = await drain(guardOverflowStream(from(chunks), OFF, ROUTE, undefined, undefined, windowResolver(FULL_WINDOW), measure))
+  assert.deepEqual(out, chunks)
+  assert.deepEqual(measure.calls, [])
 })

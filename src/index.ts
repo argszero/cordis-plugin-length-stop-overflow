@@ -1,7 +1,7 @@
 /**
  * Length-stop overflow guard for the dsh harness.
  *
- * Three ways a provider can reject an over-long request without ever saying
+ * Four ways a provider can reject an over-long request without ever saying
  * "context window exceeded". Each leaves the session unable to make progress,
  * and each is repaired here by restoring the one classification the built-in
  * recovery keys on.
@@ -117,6 +117,60 @@
  * {@link classifySaturatedFailure} for the gates that keep it from swallowing a
  * failure something else already explains.
  *
+ * ## Trigger 4 — a full request refused with nothing to read (#9434)
+ *
+ * The fourth shape has no evidence at all on the wire. The reported case
+ * (discussion #9434) is a provider (`opencode-go`, `deepseek-v4.1-flash`,
+ * catalog `contextWindow: 1000000`, `maxTokens: 384000`) that requires
+ * `prompt_tokens + max_tokens <= 2^20` and answers **HTTP 400** with a 31-byte
+ * body — `{"model":"deepseek-v4.1-flash"}`, no `error` field — so the OpenAI SDK
+ * surfaces `400 status code (no body)`. The reporter's session crossed the real
+ * wall at ~664,576 prompt tokens (63% of the advertised window) and every
+ * subsequent request failed, including the ones a manual `/compact` would have
+ * replaced; only `/compact` itself recovered it.
+ *
+ * Nothing in triggers 1-3 can read that failure:
+ *
+ * - there is no `length` stop (trigger 1) and no size wording anywhere in a
+ *   31-byte body (trigger 2), so `isRequestTooLargeFailure` finds nothing to
+ *   match;
+ * - the prompt arrives as `INVALID_REQUEST` with `usage: 0`, so the count
+ *   trigger 3 compares against the window is zero — and the adapter's ceiling is
+ *   the *declared* window (1,000,000), which this prompt never reached.
+ *
+ * What is left is arithmetic the harness can do on its own side: how big is the
+ * request it just sent? The plugin asks the *harness' own meter* for that number
+ * (`ctx.get('tokenMeter').measure(session).totalTokens` — the same measurement
+ * `compaction-basic/src/index.ts:278` compares against its own threshold), and
+ * compares it against the window the route advertises. A request that has filled
+ * most of the window and was refused by a code that attributes nothing is one
+ * where the only remaining lever is the recovery that shrinks what is sent.
+ *
+ * **This is a decision under an unobservable, not an identity** — and the README
+ * says so. The number that would make it an identity is the output budget
+ * actually carried on the wire, and it is not reachable from a plugin:
+ *
+ * - `adapter.ts:405` forwards `options.maxTokens` only when the call carries one,
+ *   and a loop-built request carries one only when the session's effective
+ *   envelope names it (`call-config.ts:23`);
+ * - otherwise pi-ai sizes the request from `Model.maxTokens` and then clamps it
+ *   against the window (`streamSimple` → `buildBaseOptions` →
+ *   `clampMaxTokensToContext`, `@earendil-works/pi-ai/dist/api/simple-options.js`),
+ *   using a *local estimate* that can sit tens of thousands of tokens below the
+ *   provider's own count;
+ * - and the catalog capability behind both is **not** part of
+ *   `LlmResolvedModelInfo` (`llm/src/types.ts:410`) — `maxTokens` appears there
+ *   only on a *discovered* model (`types.ts:316`), which is a settings-time
+ *   draft, not the request path.
+ *
+ * So the line this rule acts on is a policy, stated as one:
+ * {@link DEFAULT_FULL_REQUEST_RATIO} of the declared window. It is deliberately
+ * **below** the compaction threshold, because the whole defect is that the
+ * provider's real input capacity can be smaller than the window the harness
+ * believes in, and nothing else in the tree can discover that. The failure text
+ * carries both numbers and the line, so the verdict is checkable against the
+ * session log rather than taken on trust.
+ *
  * ## What it does
  *
  * Observes the public `llm/stream` waterfall and rewrites the terminal frame
@@ -170,6 +224,16 @@
  * twice: no count, or no resolved window, and nothing happens. `max-tokens`
  * finishes are untouched by it, so raising the ratio can never widen the
  * truncation rule behind an operator's back.
+ *
+ * The full-request rule shares the saturation rule's attributed-code gates
+ * exactly, and differs in the evidence it reads: the *harness' own* measurement
+ * of the request instead of the provider's count. That makes it the only rule
+ * that can act when the provider said nothing at all — and it is fail-closed
+ * three times over: no `sessions`/`tokenMeter` service, no session for the id
+ * the request carried, or a measurement that is not a finite non-negative
+ * number, and nothing happens. Its line is a policy rather than an identity
+ * (see trigger 4 above), which is why {@link DEFAULT_FULL_REQUEST_RATIO} is
+ * documented as a decision and exposed as `fullRequestRatio`.
  *
  * @module @argszero/cordis-plugin-length-stop-overflow
  */
@@ -260,6 +324,49 @@ export const DEFAULT_CLASSIFY_SATURATED_FAILURES = true
  */
 export const DEFAULT_SATURATION_RATIO = 0.99
 
+/**
+ * Whether a full request refused with nothing to read is reclassified too
+ * (default).
+ *
+ * On by default for the same reason the other two are: the alternative is a
+ * session that cannot send anything and reports a code no recovery reads. This
+ * is the only rule that acts on an unattributed refusal the provider gave no
+ * numbers for at all — the shape where every other reading has nothing to work
+ * with. Turn it off to keep the plugin exactly as it was before 0.4.0.
+ */
+export const DEFAULT_CLASSIFY_FULL_REQUEST_REFUSALS = true
+
+/**
+ * Fraction of the declared context window at which an unattributed refusal of
+ * this request reads as an overflow.
+ *
+ * **A policy, not an identity** — read trigger 4 in the module doc for why the
+ * number that would make it an identity (the output budget actually carried on
+ * the wire) cannot be reached from a plugin. What the rule *knows* is the
+ * harness' own measurement of the request it just sent, and the window the route
+ * advertises.
+ *
+ * The default sits at one half, **below** the compaction policy's own
+ * `thresholdRatio` (0.8), and that ordering is the point: the defect this rule
+ * exists for is a provider whose real input capacity is *smaller* than the
+ * window it advertises (discussion #9434: a `2^20` combined cap against a
+ * declared 1,000,000), so a request can be past the wall while the harness'
+ * pressure accounting still reports headroom. A rule that only fired at the
+ * compaction line would never see the reported session: its prompt was refused
+ * at 67% of the declared window.
+ *
+ * The cost is asymmetric and bounded, which is what makes a loose line safe: a
+ * false positive spends one compaction (and the loop's `maxOverflowRetries`
+ * default of 1 caps the retry), while a false negative is a session that can
+ * never send anything again. Nothing is rewritten unless the failure already
+ * declined every other reading, so a healthy turn is never affected.
+ *
+ * Raise it toward `1` to act only on requests that have essentially filled the
+ * declared window; lower it when a provider's real ceiling turns out to sit well
+ * under the declared one.
+ */
+export const DEFAULT_FULL_REQUEST_RATIO = 0.5
+
 /** Plugin configuration. */
 export interface Config {
   /**
@@ -296,6 +403,18 @@ export interface Config {
    * prompt count reads as saturated. Default 0.99.
    */
   saturationRatio?: number
+  /**
+   * Whether an `error` finish whose code names no other cause, on a request the
+   * harness' own meter prices at or above `fullRequestRatio` of the resolved
+   * window, is reclassified as `CONTEXT_WINDOW_EXCEEDED`. Default `true`.
+   */
+  classifyFullRequestRefusals?: boolean
+  /**
+   * Fraction of the declared context window at or above which the *harness'
+   * own* measurement of the request reads as full. Default 0.5 — a policy
+   * rather than an identity; see {@link DEFAULT_FULL_REQUEST_RATIO}.
+   */
+  fullRequestRatio?: number
 }
 
 /** Resolved config: every field carries its validated default. */
@@ -307,6 +426,8 @@ export const Config: z<Config> = z.object({
   classifyOversizeRequests: z.boolean().default(DEFAULT_CLASSIFY_OVERSIZE_REQUESTS),
   classifySaturatedFailures: z.boolean().default(DEFAULT_CLASSIFY_SATURATED_FAILURES),
   saturationRatio: z.number().min(0).default(DEFAULT_SATURATION_RATIO),
+  classifyFullRequestRefusals: z.boolean().default(DEFAULT_CLASSIFY_FULL_REQUEST_REFUSALS),
+  fullRequestRatio: z.number().min(0).default(DEFAULT_FULL_REQUEST_RATIO),
 })
 
 /**
@@ -402,8 +523,42 @@ export interface SaturationEvidence {
   requestId?: ProviderRequestId
 }
 
+/**
+ * What a full request refused with nothing to read looked like (discussion
+ * #9434).
+ *
+ * Both numbers are the harness' own, and the third is the line between them:
+ * `measuredTokens` is what `dsh-token-meter` prices the request at — the same
+ * measurement `compaction-basic/src/index.ts:278` compares against its own
+ * threshold — and `contextWindow` is what the adapter resolves for the route the
+ * request went to. `threshold` is `fullRequestRatio × contextWindow` rounded
+ * down, the line the measurement had to reach.
+ *
+ * Unlike {@link SaturationEvidence} these are **not** the provider's numbers,
+ * and the failure text says so: the provider named nothing numeric, which is
+ * exactly the case this rule exists for.
+ */
+export interface FullRequestEvidence {
+  /** Discriminant: this detection came from the harness' own measurement of a refused request. */
+  rule: 'full-request-refused'
+  /** Tokens `dsh-token-meter` priced this request at. */
+  measuredTokens: number
+  /** Context capacity the route advertises, as the adapter resolved it. */
+  contextWindow: number
+  /** The line the measurement reached: `floor(fullRequestRatio × contextWindow)`. */
+  threshold: number
+  /** The code the harness reported, which this rule read as an attribution to nothing. */
+  code: string
+  /** The provider's own message, verbatim — the only durable trace of what it said. */
+  providerMessage: string
+  /** HTTP status the adapter reported, when it reported one. */
+  status?: number
+  /** Request identifier the adapter reported, when it reported one. */
+  requestId?: ProviderRequestId
+}
+
 /** One reclassification this guard performed (or, in `warn` mode, would have performed). */
-export type OverflowDetection = TruncationEvidence | OversizeEvidence | SaturationEvidence
+export type OverflowDetection = TruncationEvidence | OversizeEvidence | SaturationEvidence | FullRequestEvidence
 
 /**
  * Whether one terminal finish is a truncation rather than an output cap.
@@ -671,15 +826,96 @@ export function classifySaturatedFailure(
 }
 
 /**
- * Classify one terminal finish against both rules.
+ * The full-request rule's gates that need no context window and no measurement.
+ *
+ * The same attributed-code gates as {@link isSaturatedCandidate}, minus its
+ * requirement of a provider count — the provider count is precisely what this
+ * rule does *not* have. Kept separate for the same reason: resolving a window
+ * costs an adapter call and measuring a request costs a pass over the session
+ * surface, so the guard asks these questions first and reaches for either only
+ * when they all pass.
+ *
+ * Every gate here is a reason *not* to act, which is the direction this rule has
+ * to fail in: like the saturation rule, it turns a general failure into an
+ * overflow.
+ *
+ * @param failure - the terminal `error` finish's failure.
+ * @param config - resolved plugin config.
+ * @returns `true` when only the measurement and the window comparison are left
+ *   to decide.
+ */
+export function isFullRequestCandidate(failure: LlmFailure, config: ResolvedConfig): boolean {
+  if (!config.classifyFullRequestRefusals) return false
+  if (ATTRIBUTED_CODES.has(failure.code)) return false
+  return !isAttributedStatus(failure.status)
+}
+
+/**
+ * Whether one terminal failure is an unattributed refusal of a request the
+ * harness' own meter prices as full (discussion #9434).
+ *
+ * The arithmetic is the harness' own on both sides: `tokenMeter.measure` prices
+ * the request the loop just sent — surface nodes, system prompt and tool
+ * schemas, under the route's own image pricing — and the adapter resolves the
+ * window the route advertises. A request that has consumed at least
+ * `fullRequestRatio` of that window, refused with a code that attributes
+ * nothing, is a request whose only remaining lever is the recovery that shrinks
+ * what is sent. The reported case is a provider enforcing a combined
+ * `prompt + max_tokens` cap well below the window it declares, which is why the
+ * line sits below the compaction policy's own threshold.
+ *
+ * Fail-closed on data the plugin does not own: a request the caller built
+ * without a session id, a session the store no longer holds, a meter that is not
+ * mounted, an unresolvable window, or a measurement that is not a finite
+ * non-negative number all mean no verdict — and `measureRequestTokens` returns
+ * `undefined` for every one of them.
+ *
+ * @param failure - the terminal `error` finish's failure.
+ * @param measuredTokens - what the harness' own meter priced this request at,
+ *   or `undefined` when it could not be measured.
+ * @param contextWindow - the route's resolved context capacity, or `undefined`
+ *   when the adapter reports none.
+ * @param config - resolved plugin config.
+ * @returns the evidence when the failure should be reclassified, else `null`.
+ */
+export function classifyFullRequestRefusal(
+  failure: LlmFailure,
+  measuredTokens: number | undefined,
+  contextWindow: number | undefined,
+  config: ResolvedConfig,
+): FullRequestEvidence | null {
+  if (!isFullRequestCandidate(failure, config)) return null
+  // The service already validates an adapter's capacity as a positive integer
+  // (`llm/src/index.ts:773`); this repeats it because a plugin must not trust a
+  // number it did not validate itself.
+  if (contextWindow === undefined || !Number.isInteger(contextWindow) || contextWindow <= 0) return null
+  if (measuredTokens === undefined || !Number.isFinite(measuredTokens) || measuredTokens < 0) return null
+  const threshold = Math.floor(config.fullRequestRatio * contextWindow)
+  if (measuredTokens < threshold) return null
+  return {
+    rule: 'full-request-refused',
+    measuredTokens,
+    contextWindow,
+    threshold,
+    code: failure.code,
+    providerMessage: failure.message,
+    ...failure.status === undefined ? {} : { status: failure.status },
+    ...failure.requestId === undefined ? {} : { requestId: failure.requestId },
+  }
+}
+
+/**
+ * Classify one terminal finish against the two rules that need no window.
  *
  * The cheap discriminant first: a `max-tokens` finish is a truncation question,
  * an `error` finish is a refusal question, and everything else passes through.
  *
- * The saturation rule is not here: it needs the route's resolved window, which
- * only an adapter call can answer, so {@link guardOverflowStream} evaluates it
- * separately — after this function has declined the finish *and* after the
- * saturation rule's own gates have passed on the failure alone.
+ * The saturation and full-request rules are not here: both need the route's
+ * resolved window, which only an adapter call can answer (and the full-request
+ * rule additionally needs the harness' own measurement of the request), so
+ * {@link guardOverflowStream} evaluates them separately — after this function has
+ * declined the finish *and* after each rule's own window-free gates have passed
+ * on the failure alone.
  *
  * @param reason - the stream's terminal finish reason.
  * @param usage - the last `usage` chunk seen, or `undefined` when none arrived.
@@ -692,6 +928,75 @@ export function classifyFinish(
   config: ResolvedConfig,
 ): OverflowDetection | null {
   return classifyLengthStop(reason, usage, config) ?? classifyOversizeFailure(reason, config)
+}
+
+/**
+ * The two services the full-request rule reads, declared **structurally**.
+ *
+ * The rule's evidence is the harness' own token measurement, which lives behind
+ * two services: the session store that owns the `Session` object and the meter
+ * that prices it. Reading either by type would put `@deepseek-ai/dsh-session` and
+ * `@deepseek-ai/dsh-token-meter` into this package's runtime closure (the
+ * packaging guard in `test/packaging.test.js` counts a type-only `import … from`
+ * as a bare specifier), and neither is something this plugin may require: a
+ * profile without a meter still gets triggers 1-3, and the fourth rule is
+ * fail-closed without one.
+ *
+ * So the shapes are stated here, and `ctx.get(name)` — cordis' documented
+ * *untracked* read, which returns `undefined` for a service nobody provided — is
+ * how they are reached. A shape that drifts from the real service fails the same
+ * way the service being absent does: `measureRequestTokens` catches it and the
+ * rule declines, rather than the plugin failing to load.
+ */
+interface MeasurableMeter {
+  /** Deeply immutable pressure measurement for one session (see `dsh-token-meter`). */
+  measure(session: unknown): { totalTokens: number }
+}
+
+/** The slice of the `sessions` service the rule looks a session up through. */
+interface SessionLookup {
+  /** The live session for an id, or `undefined` when the store does not hold one. */
+  get(id: unknown): unknown
+}
+
+/**
+ * What the harness' own meter prices the request that just failed at.
+ *
+ * This is the measurement the full-request rule compares against the route's
+ * window, and it is deliberately the *harness'* number rather than one this
+ * plugin derives: `dsh-compaction-basic` compares the same
+ * `meter.measure(agent.session).totalTokens` against its own threshold
+ * (`compaction-basic/src/index.ts:278`), so the two verdicts are stated in one
+ * currency and an operator can check one against the other. It prices the
+ * session surface, the system prompt and the tool schemas under the route's own
+ * image pricing, which a plugin measuring `options.messages` alone could not.
+ *
+ * Fail-closed at every step a plugin does not own: the request carried no
+ * session id, the store does not hold that session, either service is absent, or
+ * the measurement is not a finite non-negative number. Called only when the rule
+ * is about to decide, so a healthy turn never pays for the pass over the
+ * surface.
+ *
+ * @param ctx - the plugin's Cordis context.
+ * @param sessionId - the session id the request carried (`GenerateOptions.sessionId`).
+ * @returns the priced token count, or `undefined` when it cannot be read.
+ */
+export function measureRequestTokens(ctx: Context, sessionId: GenerateOptions['sessionId']): number | undefined {
+  if (sessionId === undefined) return undefined
+  const sessions = ctx.get('sessions') as SessionLookup | undefined
+  const meter = ctx.get('tokenMeter') as MeasurableMeter | undefined
+  if (sessions === undefined || meter === undefined) return undefined
+  const session = sessions.get(sessionId)
+  if (session === undefined) return undefined
+  try {
+    const measured = meter.measure(session).totalTokens
+    return Number.isFinite(measured) && measured >= 0 ? measured : undefined
+  } catch {
+    // A meter that cannot price this session is one this rule cannot judge. The
+    // finish keeps the code the adapter chose, which is what would have happened
+    // without the plugin.
+    return undefined
+  }
 }
 
 /**
@@ -827,6 +1132,43 @@ export function saturationFailure(evidence: SaturationEvidence, route: { provide
 }
 
 /**
+ * The `CONTEXT_WINDOW_EXCEEDED` failure that replaces an unattributed refusal of
+ * a full request.
+ *
+ * The provider's own message is carried over verbatim for the same reason as on
+ * the other rewrites — it is the only record of what the failing request said,
+ * and here it is likely to be the adapter's body-less fallback
+ * (`400 status code (no body)`), which is itself the finding. Both numbers are
+ * the harness' own and both are named as such: the meter's price for the request
+ * and the window the route advertises, with the line the ratio put between them.
+ * That is what makes a *policy* verdict checkable — a reader can see how far the
+ * request sat above the line this rule acts on, and how far below the compaction
+ * policy's own.
+ *
+ * `providerRetryAfterMs` is dropped for the same reason as on the other two
+ * rewrites: waiting does not make an oversized request smaller, and this code is
+ * not retryable.
+ *
+ * @param evidence - what the refused request measured and what the route declares.
+ * @param route - the provider/model the request went to.
+ * @returns the failure the loop routes to `agent/request-error`.
+ */
+export function fullRequestFailure(evidence: FullRequestEvidence, route: { provider: string; model: string }): LlmFailure {
+  const ratio = (evidence.measuredTokens / evidence.contextWindow).toFixed(2)
+  return {
+    code: CONTEXT_WINDOW_EXCEEDED_CODE,
+    message: `${route.provider}/${route.model} refused the request as ${evidence.code} while this session's own`
+      + ` meter priced it at ${evidence.measuredTokens} token(s) against the ${evidence.contextWindow}-token window`
+      + ` that route advertises (${ratio}x, at or above the ${evidence.threshold}-token line this rule acts on):`
+      + ` ${evidence.providerMessage}. Reclassified as ${CONTEXT_WINDOW_EXCEEDED_CODE} by length-stop-overflow`
+      + ' (discussion #9434): the refusal named no cause and carried no usable count, and on a request this full the'
+      + ' only built-in recovery that can shrink what is sent is context-overflow compaction.',
+    ...evidence.status === undefined ? {} : { status: evidence.status },
+    ...evidence.requestId === undefined ? {} : { requestId: evidence.requestId },
+  }
+}
+
+/**
  * Replace one terminal finish with the overflow failure the recovery path reads.
  *
  * Replay metadata is dropped on both paths: it describes a successful response
@@ -849,7 +1191,9 @@ export function rewriteFinish(
     ? overflowFailure(detection, route)
     : detection.rule === 'request-too-large'
       ? oversizeFailure(detection, route)
-      : saturationFailure(detection, route)
+      : detection.rule === 'context-saturated'
+        ? saturationFailure(detection, route)
+        : fullRequestFailure(detection, route)
   return { ...rest, reason: { kind: 'error', failure } }
 }
 
@@ -871,9 +1215,16 @@ export function rewriteFinish(
  * @param requestBytes - measures the request on demand. Called only when the
  *   size rule detects, so a healthy request is never serialized.
  * @param resolveWindow - resolves the route's context capacity on demand. Called
- *   only when every other rule has declined the finish *and* the saturation
- *   rule's window-independent gates have passed, so a healthy turn never pays an
- *   adapter lookup for it. Returning `undefined` fails the rule closed.
+ *   only when every other rule has declined the finish *and* the rule that needs
+ *   it has passed its own window-free gates, so a healthy turn never pays an
+ *   adapter lookup for it. Resolved at most once per finish, because the
+ *   saturation and full-request rules ask the same question. Returning
+ *   `undefined` fails the rules closed.
+ * @param measureRequest - measures the request on demand, in the harness' own
+ *   currency (`measureRequestTokens`). Called only when every other rule has
+ *   declined *and* the full-request rule's window-free gates have passed, so a
+ *   healthy turn never pays for a pass over the session surface. Returning
+ *   `undefined` fails the rule closed.
  * @returns the stream, with an unnameable overflow reported as
  *   `CONTEXT_WINDOW_EXCEEDED`.
  */
@@ -884,6 +1235,7 @@ export async function* guardOverflowStream(
   onDetect?: (detection: OverflowDetection) => void,
   requestBytes?: () => number | undefined,
   resolveWindow?: (provider: string, model: string) => Promise<number | undefined>,
+  measureRequest?: () => number | undefined,
 ): AsyncIterable<StreamChunk> {
   if (config.mode === 'off') {
     for await (const chunk of source) yield chunk
@@ -900,14 +1252,34 @@ export async function* guardOverflowStream(
     }
     if (chunk.type === 'finish') {
       let detection = classifyFinish(chunk.reason, usage, config)
-      // The saturation rule is the only one that needs the route's window, and
-      // resolving it costs an adapter call, so it runs last and only for a finish
-      // the cheaper rules have already declined. A `max-tokens` finish never
-      // reaches it: the truncation rule owns that shape.
-      if (detection === null && chunk.reason.kind === 'error'
-        && isSaturatedCandidate(chunk.reason.failure, usage, config) && resolveWindow !== undefined) {
-        const contextWindow = await resolveWindow(route.provider, route.model)
-        detection = classifySaturatedFailure(chunk.reason.failure, usage, contextWindow, config)
+      // The last two rules need the route's resolved window, which costs an
+      // adapter call, so they run after the cheaper rules have declined the
+      // finish and only for a finish their own window-free gates accept. One
+      // resolution serves both: they ask the same question about the same route.
+      if (detection === null && chunk.reason.kind === 'error') {
+        const { failure } = chunk.reason
+        let cached: number | undefined
+        let resolved = false
+        const contextWindow = async (): Promise<number | undefined> => {
+          if (resolved) return cached
+          resolved = true
+          cached = resolveWindow === undefined ? undefined : await resolveWindow(route.provider, route.model)
+          return cached
+        }
+        // The provider's own count first: it is the stronger evidence, and the
+        // rule that reads it is the one the reporter's numbers named.
+        if (isSaturatedCandidate(failure, usage, config)) {
+          detection = classifySaturatedFailure(failure, usage, await contextWindow(), config)
+        }
+        // Then the harness' own measurement — the only reading left when the
+        // provider named nothing at all, and the only rule of the four that can
+        // act on a failure carrying no count of any kind.
+        if (detection === null && measureRequest !== undefined && isFullRequestCandidate(failure, config)) {
+          const measured = measureRequest()
+          if (measured !== undefined) {
+            detection = classifyFullRequestRefusal(failure, measured, await contextWindow(), config)
+          }
+        }
       }
       if (detection !== null) {
         const measured = detection.rule === 'request-too-large' ? requestBytes?.() : undefined
@@ -959,6 +1331,8 @@ export function apply(ctx: Context, config: Config = {}): void {
     classifyOversizeRequests: config.classifyOversizeRequests ?? DEFAULT_CLASSIFY_OVERSIZE_REQUESTS,
     classifySaturatedFailures: config.classifySaturatedFailures ?? DEFAULT_CLASSIFY_SATURATED_FAILURES,
     saturationRatio: config.saturationRatio ?? DEFAULT_SATURATION_RATIO,
+    classifyFullRequestRefusals: config.classifyFullRequestRefusals ?? DEFAULT_CLASSIFY_FULL_REQUEST_REFUSALS,
+    fullRequestRatio: config.fullRequestRatio ?? DEFAULT_FULL_REQUEST_RATIO,
   }
 
   ctx.on('llm/stream', (options: GenerateOptions, next: () => AsyncIterable<StreamChunk>) => {
@@ -997,6 +1371,21 @@ export function apply(ctx: Context, config: Config = {}): void {
           )
           return
         }
+        if (detection.rule === 'full-request-refused') {
+          ctx.logger.warn(
+            'length-stop-overflow: %s/%s failed as %s while this session priced at %d token(s) on a %d-token window (%.2fx, line %d): %s; %s (discussion #9434)',
+            options.provider,
+            options.model,
+            detection.code,
+            detection.measuredTokens,
+            detection.contextWindow,
+            detection.measuredTokens / detection.contextWindow,
+            detection.threshold,
+            detection.providerMessage,
+            verdict,
+          )
+          return
+        }
         ctx.logger.warn(
           'length-stop-overflow: %s/%s refused the request as too large (%s: %s)%s; %s (discussion #7626)',
           options.provider,
@@ -1019,6 +1408,11 @@ export function apply(ctx: Context, config: Config = {}): void {
           return undefined
         }
       },
+      // Read through `ctx.get`, not a service property: the plugin declares only
+      // `llm`, so a profile without a meter (or without a session store) keeps
+      // triggers 1-3 and loses only this one — where a declared dependency
+      // would have kept the whole plugin from loading.
+      () => measureRequestTokens(ctx, options.sessionId),
     )
   })
 }
